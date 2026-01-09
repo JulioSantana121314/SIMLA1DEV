@@ -1,8 +1,11 @@
 # Kamshub Messaging Platform — Project Documentation (Living Doc)
 
-**Last updated:** 2025-12-31 18:36 UTC
+**Last updated:** 2026-01-09 02:58 UTC
+
+---
 
 ## IMPORTANT: How this file is maintained
+
 This is a *living* specification for the Kamshub messaging platform.
 
 - After every new requirement, design decision, or code/infra change, this file must be updated.
@@ -12,18 +15,22 @@ This is a *living* specification for the Kamshub messaging platform.
 ---
 
 ## 1) What we are building
+
 A multi-tenant unified inbox system where:
+
 - **Tenant = one company/organization**.
 - Each tenant can connect **multiple Telegram bots** and **multiple Meta Messenger pages**.
 - The system can **receive** inbound messages (webhooks) and **send** outbound messages (replies) through the correct connected channel.
 - Users belong to **exactly one tenant** (MVP decision) and have roles that determine permissions.
 
 Primary goals:
+
 - High integrity: tolerate retries/duplicates without duplicating effects (exactly-once *in our domain*).
 - Operability: queues + DLQs + redrive; visibility into failures.
 - Scalable fan-out: parallelize by conversation (not by whole tenant) while preserving ordering per conversation.
 
 Non-goals for MVP:
+
 - Billing/plans.
 - Sophisticated per-user conversation assignment/queues (roles are enough initially).
 - WhatsApp Business API integration (planned later).
@@ -31,123 +38,156 @@ Non-goals for MVP:
 ---
 
 ## 2) Current AWS footprint (Dev)
+
 Region: **us-east-2 (Ohio)**.
 
 ### 2.1 AWS Accounts / org
+
 - AWS Organization exists.
 - Workload/dev account exists: **Kamshub-Msg-Dev**.
 
 ### 2.2 SQS queues (FIFO)
+
 Four queues per environment:
+
 - `kamshub-msg-dev-incoming.fifo`
 - `kamshub-msg-dev-incoming-dlq.fifo`
 - `kamshub-msg-dev-send.fifo`
 - `kamshub-msg-dev-send-dlq.fifo`
 
 Notes:
+
 - FIFO requires `MessageGroupId`.
 - DLQs connected via redrive policy (maxReceiveCount used for poison messages).
 
 ### 2.3 Lambda functions
-- `kamshub-msg-dev-webhook` (Function URL / HTTP endpoint): receives inbound events and enqueues to `incoming.fifo`.
-- `kamshub-msg-dev-processor`: consumes from `incoming.fifo`, persists/normalizes/dedupes, and writes outbox/send-requests.
-- `kamshub-msg-dev-sender`: consumes from `send.fifo` and sends outbound messages to the external channel APIs.
 
-SQS event source mapping:
-- `ReportBatchItemFailures = true`.
-- `BatchSize` small during debugging (often 1).
+- `kamshub-msg-dev-api` (Function URL / HTTP endpoint):
+  - Auth endpoints:
+    - `POST /auth/login`: inicia sesión con email/password (Cognito `ADMIN_USER_PASSWORD_AUTH`), devuelve `accessToken`, `idToken`, `refreshToken`. [web:2799]
+    - `POST /auth/complete-new-password`: completa challenge `NEW_PASSWORD_REQUIRED` y devuelve tokens. [web:2771]
+    - `GET /me`: valida IdToken de Cognito y devuelve `userId`, `email`, `tenantId`, `roles`. [web:2791]
+  - Plataforma:
+    - `POST /platform/bootstrap`: crea primer `platform_admin`.
+    - `POST /platform/tenants`: crea tenant + `tenant_admin`.
+  - Tenants:
+    - `POST /tenant/channels`: crea un canal de mensajería para el tenant autenticado, persistiendo en MongoDB.
+
+(Otras Lambdas de pipeline de mensajes – `...-webhook`, `...-processor`, `...-sender` – siguen diseñadas pero no se detallan aquí aún.)
 
 ---
 
 ## 3) High-level architecture
+
 ### 3.1 Inbound pipeline
-1) External provider webhook → Lambda `...-webhook` (Function URL)
-2) `...-webhook` validates basic request + parses payload
-3) `...-webhook` publishes to `incoming.fifo`
-4) `...-processor` consumes, normalizes and performs idempotent processing
-5) `...-processor` writes to MongoDB (events/messages/conversations) and creates outbox items
+
+1. External provider webhook → Lambda `...-webhook` (Function URL).
+2. `...-webhook` valida request + parsea payload.
+3. `...-webhook` publica en `incoming.fifo`.
+4. `...-processor` consume, normaliza y hace procesamiento idempotente.
+5. `...-processor` escribe en MongoDB (events/messages/conversations) y crea outbox items.
 
 ### 3.2 Outbound pipeline
-1) `...-processor` (or API/UI action) creates Outbox record (durable)
-2) Dispatcher publishes to `send.fifo` (or sender pulls pending outbox)
-3) `...-sender` sends to Telegram/Messenger API
-4) Sender marks outbox item as SENT (or FAILED with retry metadata)
+
+1. `...-processor` (o API/UI action) crea registro Outbox (durable).
+2. Dispatcher publica a `send.fifo` (o sender lee de outbox pendiente).
+3. `...-sender` envía a la API de Telegram/Messenger.
+4. Sender marca outbox item como SENT (o FAILED con metadata de reintentos).
 
 ---
 
 ## 4) Data integrity patterns
+
 ### 4.1 Reality: delivery is at-least-once
-Webhooks + queues can deliver duplicates; the system must assume duplicates can happen.
+
+Webhooks + queues pueden entregar duplicados; el sistema debe asumir que los duplicados ocurren.
 
 ### 4.2 Inbox / Idempotent Consumer (Inbound)
-- Persist inbound events and dedupe using a unique key:
-  - Prefer provider’s immutable `eventId`/`externalMessageId`.
-- Maintain state per inbound event (example): `RECEIVED → PROCESSING → PROCESSED` (or `FAILED`).
+
+- Persistir eventos inbound y deduplicar usando una clave única:
+  - Preferir `eventId`/`externalMessageId` inmutable del proveedor.
+- Mantener estado por evento inbound, por ejemplo: `RECEIVED → PROCESSING → PROCESSED` (o `FAILED`).
 
 ### 4.3 Outbox (Outbound)
-- Never rely on “DB write + send” as two loose steps.
-- Create a durable outbox item first; retries read from outbox state.
-- Maintain outbound dedupe keys (`sendId`) to avoid double-sends.
+
+- Nunca confiar en “DB write + send” como pasos sueltos.
+- Crear primero un outbox item durable; los retries leen del estado de outbox.
+- Mantener claves de dedupe outbound (`sendId`) para evitar double-sends.
 
 ---
 
 ## 5) FIFO ordering & concurrency
+
 Design target:
-- Preserve order **within a conversation**.
-- Allow parallelism **across conversations**.
+
+- Preservar orden **dentro de una conversación**.
+- Permitir paralelismo **entre conversaciones**.
 
 Guideline:
-- `MessageGroupId` should be derived from `(tenantId, conversationId)` (or a stable conversation key).
+
+- `MessageGroupId` debe derivarse de `(tenantId, conversationId)` (o una clave de conversación estable).
 
 Deduplication:
-- Prefer `MessageDeduplicationId = providerEventId` (stable) rather than random UUID (random disables practical dedupe).
+
+- Preferir `MessageDeduplicationId = providerEventId` (estable) en vez de UUID random (el random elimina dedupe práctico).
 
 ---
 
 ## 6) Multi-tenancy model
+
 ### 6.1 Tenant definition
-- Tenant represents a company/organization.
-- All resources are owned by exactly one tenant.
+
+- Tenant representa una empresa/organización.
+- Todos los recursos pertenecen a exactamente un tenant.
 
 ### 6.2 Tenant isolation requirements
-- Every query/write must include `tenantId` filtering.
-- Every object-level endpoint must enforce `resource.tenantId == auth.tenantId`.
+
+- Cada query/write debe incluir filtro por `tenantId`.
+- Cada endpoint de objetos debe reforzar `resource.tenantId == auth.tenantId`.
 
 ### 6.3 Roles (MVP)
-- `platform_admin`: platform-level operations (dangerous actions).
-- `tenant_admin`: full permissions within tenant.
-- `tenant_manager`: limited admin within tenant (rename/activate/deactivate channels; operate inbox).
 
-MVP decision: **roles are enough initially** (no per-user conversation assignment/visibility rules yet).
+- `platform_admin`: operaciones a nivel plataforma (acciones peligrosas).
+- `tenant_admin`: permisos completos dentro del tenant.
+- `tenant_manager`: admin limitado dentro del tenant (renombrar/activar/desactivar canales; operar inbox).
+
+MVP decision: **roles son suficientes inicialmente** (sin reglas de visibilidad por conversación/usuario).
 
 ---
 
-## 7) Authentication & authorization (Recommended)
+## 7) Authentication & authorization
+
 ### 7.1 Choice
-Use **Amazon Cognito User Pools**.
+
+Usar **Amazon Cognito User Pools**. [web:2791]
 
 ### 7.2 Cognito model (single pool, multi-tenant via claim)
-- One user pool shared across tenants.
-- Add custom attribute: `custom:tenantID`.
-- Users belong to exactly one tenant.
-- Roles can be represented as Cognito Groups or a custom claim.
+
+- Un user pool compartido entre tenants.
+- Atributo custom: `custom:tenantID`.
+- Usuarios pertenecen a un solo tenant.
+- Roles representados como **Cognito Groups** o custom claim. [web:2791]
 
 ### 7.3 API enforcement
-- All API requests validate JWT and derive:
-  - `auth.tenantId` from token claim
-  - `auth.role`
-- Enforce RBAC + object-level authorization.
+
+- Todas las requests validan JWT y derivan:
+  - `auth.tenantId` desde claim.
+  - `auth.role`.
+- Se aplica RBAC + autorización a nivel de objeto.
 
 ---
 
 ## 8) Channel connectors
+
 ### 8.1 Channel entity
-Minimum fields:
+
+Campos mínimos:
+
 - `tenantId`
 - `type`: `telegram` | `messenger`
 - `displayName`
 - `externalId`:
-  - Telegram: bot username or bot id
+  - Telegram: bot username o bot id
   - Messenger: pageId
 - `encryptedCredentials`:
   - Telegram: bot token
@@ -155,21 +195,24 @@ Minimum fields:
 - `isActive` boolean
 
 Behavior:
-- If `isActive=false`, inbound events may still be ingested but hidden from inbox until reactivated.
+
+- Si `isActive=false`, los eventos inbound pueden seguir ingresando pero ocultos del inbox hasta reactivación.
 
 ### 8.2 Telegram multi-bot
-- One webhook per bot.
-- Support many bots pointing to same domain using distinct routes:
+
+- Un webhook por bot.
+- Soportar muchos bots contra el mismo dominio usando rutas distintas:
   - `/webhooks/telegram/{{channelId}}`
 
 ### 8.3 Messenger multi-page
-- OAuth login grants access to pages.
-- Backend lists pages (e.g., via `/me/accounts`) and stores selected Page Access Tokens.
-- Subscribe app/page to webhooks for receiving messages.
+
+- OAuth login otorga acceso a páginas.
+- Backend lista páginas (p.ej. `/me/accounts`) y guarda Page Access Tokens seleccionados.
+- Se suscribe app/page a webhooks para recibir mensajes.
 
 ---
 
-### 9) MongoDB (planned collections)
+## 9) MongoDB (planned collections)
 
 ### 9.1 Core
 
@@ -179,7 +222,19 @@ Behavior:
 - `conversations`
 - `messages`
 
-...
+### 9.2 Integrity & operations
+
+- `inbound_events` (raw + metadata normalizada)
+- `processed_events` o índice único en `inbound_events` para idempotencia
+- `outbox_send`
+- `send_log` (dedupe + audit)
+- `audit_log` / `system_ledger`
+
+Índices típicos:
+
+- Único `(tenantId, externalMessageId)` para messages.
+- Único `(tenantId, channelId, externalThreadId)` para conversations.
+- Único `(tenantId, outboxId)` o `(tenantId, sendId)` para outbound.
 
 ---
 
@@ -187,8 +242,8 @@ Behavior:
 
 ### 9.1 Cluster & database
 
-- MongoDB cluster: Atlas (shared) – dev.
-- Database name (dev): `kamsg` (nombre de producto). [web:2867]
+- MongoDB cluster: Atlas (dev).
+- Database name (dev): `kamsg`.
 - Multi-tenant strategy: **un solo database** con colecciones compartidas filtradas por `tenantId`. [web:2845]
 
 ### 9.2 Colección `channels` (implementada)
@@ -196,186 +251,31 @@ Behavior:
 Campos actuales:
 
 - `_id`: ObjectId
-- `tenantId`: string (derivado siempre del JWT `custom:tenantID`)
+- `tenantId`: string (desde claim `custom:tenantID` del IdToken)
 - `type`: `"telegram" | "messenger"`
 - `displayName`: string
-- `externalId`: string
-- `credentials`: objeto genérico (p.ej. `{ botToken }`), pendiente de encriptar
+- `externalId`: string (por ahora se está usando un identificador tipo `my_bot_username` para Telegram)
+- `credentials`: objeto (por ahora `{ botToken }`, pendiente de encriptar)
 - `isActive`: boolean
 - `createdAt`: ISO string
 - `updatedAt`: ISO string
 
 Reglas:
 
-- `tenantId` **no** viene del body; siempre desde el token. [web:2845]
+- `tenantId` nunca viene del body; siempre desde el token validado en backend. [web:2845]
 - Solo roles `tenant_admin`, `tenant_manager` o `platform_admin` pueden crear canales.
 
+Ejemplo de documento real creado:
 
-
----
-
-## 10) Platform operations
-### 10.1 Tenant lifecycle
-Tenant statuses:
-- `Active`
-- `Blocked`
-- `DeletionScheduled` (soft state + future purge)
-
-Deletion:
-- Grace period is configurable (default 15 days) but **only platform_admin** can change it.
-- Purge job hard-deletes tenant data and credentials.
-
-### 10.2 Debug raw capture (per-tenant)
-Controlled only by `platform_admin`.
-Suggested fields:
-- `rawCaptureMode`: `off | sample | always`
-- `rawSampleRate`
-- `rawTtlDays`
-- `rawAlwaysUntil` (auto-expire)
-
-Decision: when `always` expires, fallback goes to **off**.
-
----
-
-## 11) Environments
-Recommended: separate **staging** and **prod**.
-- Tenant “Testing” should live in staging (not prod) to avoid contamination.
-
----
-
-## 12) MVP definition (acceptance)
-MVP is done when:
-1) Multi-tenant auth works (users in one tenant).
-2) A tenant can connect **multiple** Telegram bots and **multiple** Messenger pages.
-3) System can receive inbound messages from any connected channel.
-4) System can send outbound messages through the correct channel.
-5) Ordering is preserved per conversation and duplicates don’t duplicate domain effects.
-6) DLQs and redrive exist and can be operated.
-
----
-
-## 13) Roadmap / next steps (implementation order)
-1. Crear Cognito User Pool + `custom:tenantID` + role model (groups/claim). ✅ (dev)
-2. Construir Tenant onboarding API:
-   - Crear tenant
-   - Crear primer tenant admin user
-   - Crear ruta de bootstrap para platform_admin ✅ (endpoints `/platform/bootstrap`, `/platform/tenants`)
-3. Implementar core Mongo models + índices para tenant isolation e idempotencia.
-4. Implementar `/tenant/channels` APIs:
-   - **Create** ✅ (dev)
-   - rename/activate/deactivate (pendiente)
-   - Telegram connector (setWebhook/removeWebhook) (pendiente)
-   - Messenger connector (OAuth + page selection + webhook subscription) (pendiente)
-5. Implementar contrato normalizado de mensajes + lógica del processor.
-6. Implementar outbox + sender por canal.
-7. Construir UI admin mínima después (no requerido aún).
-
----
-
-## 14) Changelog
-- 2025-12-31: Created first consolidated living documentation file; captured MVP scope, AWS dev footprint, multi-tenant + Cognito decision, and roadmap.
-
-2025-12-31: Decidido usar 1 Cognito User Pool compartido con custom:tenantID (usuario pertenece a un solo tenant) y roles iniciales sin asignación de chats por usuario.
-​
-## [2026-01-07] - Cognito User Pool + Lambda API Bootstrap
-
-### Added
-- **AWS Cognito User Pool** configurado en `us-east-2`
-  - User Pool ID: `us-east-2_B9izGWtvy`
-  - Client ID: `6dv32jfp4vra4l3ttn5kqpm31d`
-  - Sign-in: Email + Username
-  - Self-registration: Disabled (solo platform_admin crea usuarios)
-  - Custom attribute: `custom:tenantID` (String, immutable, max 36 chars)
-  - Grupos: `platform_admin`, `tenant_admin`, `tenant_manager`
-  - Authentication flows: ALLOW_USER_PASSWORD_AUTH, ALLOW_ADMIN_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH
-
-- **Lambda Function** `kamshub-msg-dev-api` (Node.js 24.x, us-east-2)
-  - Function URL: `https://5ewhj564xzelbmiusggtp6qiva0mvott.lambda-url.us-east-2.on.aws/`
-  - Endpoints implementados:
-    - `POST /platform/bootstrap`: Crear primer platform_admin (público, sin autenticación)
-    - `POST /platform/tenants`: Crear tenant + tenant_admin (requiere platform_admin role)
-    - `GET /me`: Obtener info del usuario autenticado (requiere JWT válido)
-  - Middleware JWT: Verificación de ID tokens con `aws-jwt-verify` v4.0.1
-  - Role-based authorization: Función `requireRole()` valida permisos por grupo
-  - Username generation: Genera usernames alfanuméricos únicos (formato: `{emailPrefix}_{timestamp}`) para evitar conflicto con email alias
-
-- **IAM Policy** `CognitoAdminAccess` para Lambda role
-  - Permisos: AdminCreateUser, AdminAddUserToGroup, AdminUpdateUserAttributes, DescribeUserPool, ListUsers
-  - Resource: `arn:aws:cognito-idp:us-east-2:856716755654:userpool/us-east-2_B9izGWtvy`
-
-- **Dependencies** para Lambda
-  - `aws-jwt-verify`: ^4.0.1 (verificación de ID tokens)
-  - `@aws-sdk/client-cognito-identity-provider`: ^3.700.0 (admin operations)
-
-### Configuration
-- Lambda timeout: 10 seconds
-- Lambda memory: 128 MB
-- Environment variables:
-  - `COGNITO_USER_POOL_ID`: us-east-2_B9izGWtvy
-  - `COGNITO_CLIENT_ID`: 6dv32jfp4vra4l3ttn5kqpm31d
-  - `AWS_REGION_COGNITO`: us-east-2
-
-### Security
-- User Pool attribute `custom:tenantID` configurado como immutable (no puede ser modificado por usuarios ni app clients)
-- Function URL sin auth (autenticación manejada en código con JWT verification)
-- Groups en ID token: aparecen automáticamente en claim `cognito:groups`
-
-### Technical Notes
-- User Pool configurado con email alias: usernames generados programáticamente, login con email
-- JWT verification usa JWKS endpoint: `https://cognito-idp.us-east-2.amazonaws.com/us-east-2_B9izGWtvy/.well-known/jwks.json`
-- Temporary passwords: generadas por platform_admin, usuarios deben cambiar en primer login
-- MessageAction: SUPPRESS (no se envían emails de bienvenida; MVP sin SES configurado)
-
-### Next Steps
-- [ ] Crear primer platform_admin vía `/platform/bootstrap`
-- [ ] Implementar endpoint `POST /auth/login` (InitiateAuth flow)
-- [ ] Implementar endpoint `POST /auth/change-password` (responder NEW_PASSWORD_REQUIRED challenge)
-- [ ] Agregar MongoDB para persistir tenants (actualmente solo se crea en Cognito)
-- [ ] Implementar endpoints CRUD para channels, templates, inbox
-- [ ] Configurar AWS SES para emails de Cognito (opcional para producción)
-
-## Changelog autenticación Cognito (DEV)
-
-### 2026-01-08
-
-- Creado app client **público sin secret**:
-  - Nombre: `kamshub-msg-dev-public`
-  - Client ID: `2ua96l1gdgjbaiil9kj798pvf`
-- Eliminados app clients obsoletos:
-  - `kamshub-msg-dev-client`
-  - `kamshub-msg-dev-client-nosecret`
-- Actualizada Lambda `kamshub-msg-dev-api`:
-  - Env var `COGNITO_CLIENT_ID` → `2ua96l1gdgjbaiil9kj798pvf`
-- Usuario admin:
-  - Email: `admin@kamshub.online`
-  - Password inicial temporal reemplazada por `NuevaPass123!` (solo dev)
-  - Atributo `custom:tenantID` = `platform`
-  - Miembro del grupo `platform_admin`
-- Configuración MFA:
-  - MFA requerida deshabilitada en el user pool para entorno dev
-- Flujo de autenticación:
-  - Login exitoso vía `ADMIN_USER_PASSWORD_AUTH`
-  - Generación de `AccessToken`, `IdToken` y `RefreshToken` correcta
-- Endpoint `/me`:
-  - Validación de JWT funcionando usando **IdToken**
-  - Respuesta actual:
-    ```json
-    {
-      "userId": "013b05d0-2051-7079-1f60-646b9c751779",
-      "email": "admin@kamshub.online",
-      "tenantId": "platform",
-      "roles": ["platform_admin"]
-    }
-  - Definido nombre de base de datos Mongo para dev: `kamsg`. [web:2867]
-  - Añadida conexión reutilizable a MongoDB Atlas en `kamshub-msg-dev-api` usando `MongoClient` y helpers `getDb()`. [web:2850][web:2854]
-  - Nuevas env vars en Lambda:
-    - `MONGODB_URI`
-    - `MONGODB_DB_NAME` = `kamsg`
-  - Implementado endpoint protegido `POST /tenant/channels`:
-  - Requiere JWT válido y roles `tenant_admin`, `tenant_manager` o `platform_admin`.
-  - Toma `type`, `displayName`, `externalId`, `credentials` del body.
-  - Inserta documento en colección `channels` con `tenantId` derivado del token.
-  - Devuelve `201` con `id` y datos del canal creado.
-    ```
-
-
+```json
+{
+  "_id": "69606c369da01c080a4eaeae",
+  "tenantId": "platform",
+  "type": "telegram",
+  "displayName": "Soporte Telegram",
+  "externalId": "my_bot_username",
+  "credentials": { "botToken": "123:ABC" },
+  "isActive": true,
+  "createdAt": "2026-01-09T02:47:18.065Z",
+  "updatedAt": "2026-01-09T02:47:18.065Z"
+}
