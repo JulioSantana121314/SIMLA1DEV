@@ -310,3 +310,39 @@ MVP is done when:
 - [ ] Implementar endpoints CRUD para channels, templates, inbox
 - [ ] Configurar AWS SES para emails de Cognito (opcional para producción)
 
+## Changelog autenticación Cognito (DEV)
+
+### 2026-01-08
+
+- Creado app client **público sin secret**:
+  - Nombre: `kamshub-msg-dev-public`
+  - Client ID: `2ua96l1gdgjbaiil9kj798pvf`
+- Eliminados app clients obsoletos:
+  - `kamshub-msg-dev-client`
+  - `kamshub-msg-dev-client-nosecret`
+- Actualizada Lambda `kamshub-msg-dev-api`:
+  - Env var `COGNITO_CLIENT_ID` → `2ua96l1gdgjbaiil9kj798pvf`
+- Usuario admin:
+  - Email: `admin@kamshub.online`
+  - Password inicial temporal reemplazada por `NuevaPass123!` (solo dev)
+  - Atributo `custom:tenantID` = `platform`
+  - Miembro del grupo `platform_admin`
+- Configuración MFA:
+  - MFA requerida deshabilitada en el user pool para entorno dev
+- Flujo de autenticación:
+  - Login exitoso vía `ADMIN_USER_PASSWORD_AUTH`
+  - Generación de `AccessToken`, `IdToken` y `RefreshToken` correcta
+- Endpoint `/me`:
+  - Validación de JWT funcionando usando **IdToken**
+  - Respuesta actual:
+    ```json
+    {
+      "userId": "013b05d0-2051-7079-1f60-646b9c751779",
+      "email": "admin@kamshub.online",
+      "tenantId": "platform",
+      "roles": ["platform_admin"]
+    }
+    ```
+
+
+    
