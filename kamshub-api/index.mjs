@@ -1,10 +1,38 @@
+import { MongoClient } from 'mongodb';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
-import { CognitoIdentityProviderClient, AdminCreateUserCommand, AdminAddUserToGroupCommand } from '@aws-sdk/client-cognito-identity-provider';
+import {
+  CognitoIdentityProviderClient,
+  AdminCreateUserCommand,
+  AdminAddUserToGroupCommand,
+  AdminInitiateAuthCommand,
+  RespondToAuthChallengeCommand,
+} from '@aws-sdk/client-cognito-identity-provider';
 import { randomUUID } from 'crypto';
 
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID;
 const CLIENT_ID = process.env.COGNITO_CLIENT_ID;
 const cognito = new CognitoIdentityProviderClient({ region: 'us-east-2' });
+const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'kamshub_msg_dev';
+
+console.log('ENV', { USER_POOL_ID, CLIENT_ID, MONGODB_URI_PRESENT: !!MONGODB_URI, MONGODB_DB_NAME });
+
+let mongoClient;
+let mongoDb;
+
+async function getDb() {
+  if (mongoDb) return mongoDb;
+
+  if (!MONGODB_URI) {
+    throw new Error('MONGODB_URI not configured');
+  }
+
+  mongoClient = new MongoClient(MONGODB_URI);
+  await mongoClient.connect(); // se reutiliza entre invocaciones en Lambda [web:2854][web:2859]
+  mongoDb = mongoClient.db(MONGODB_DB_NAME);
+  return mongoDb;
+}
+
 
 const verifier = CognitoJwtVerifier.create({
   userPoolId: USER_POOL_ID,
@@ -93,6 +121,54 @@ async function createTenant(event) {
   return { statusCode: 201, body: JSON.stringify({ ok: true, tenantId, adminEmail, username }) };
 }
 
+async function createChannel(event) {
+  const auth = await verifyJwt(event);
+  // Solo tenants y plataforma pueden crear canales
+  requireRole(auth, ['tenant_admin', 'tenant_manager', 'platform_admin']);
+
+  const { type, displayName, externalId, credentials } = JSON.parse(event.body || '{}');
+
+  if (!type || !displayName || !externalId || !credentials) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: 'type, displayName, externalId and credentials are required' }),
+    };
+  }
+
+  if (!['telegram', 'messenger'].includes(type)) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: 'type must be telegram or messenger' }),
+    };
+  }
+
+  const db = await getDb();
+  const channels = db.collection('channels');
+
+  const now = new Date().toISOString();
+  const doc = {
+    tenantId: auth.tenantId,          // siempre desde el token, nunca del body [web:2845]
+    type,
+    displayName,
+    externalId,
+    credentials,                      // TODO: encriptar en siguiente iteración
+    isActive: true,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const result = await channels.insertOne(doc); // [web:2850][web:2862]
+
+  return {
+    statusCode: 201,
+    body: JSON.stringify({
+      id: result.insertedId.toString(),
+      ...doc,
+    }),
+  };
+}
+
+
 async function getMe(event) {
   const auth = await verifyJwt(event);
   return {
@@ -109,16 +185,126 @@ async function getMe(event) {
 export const handler = async (event) => {
   const { rawPath, requestContext } = event;
   const method = requestContext?.http?.method || event.httpMethod;
-  
+
   try {
+    // AUTH
+    if (method === 'POST' && rawPath === '/auth/login') {
+      return await login(event);
+    }
+    if (method === 'POST' && rawPath === '/auth/complete-new-password') {
+      return await completeNewPassword(event);
+    }
+
+    // PLATFORM
     if (method === 'POST' && rawPath === '/platform/bootstrap') return await bootstrap(event);
     if (method === 'POST' && rawPath === '/platform/tenants') return await createTenant(event);
+
+    // TENANT
+    if (method === 'POST' && rawPath === '/tenant/channels') return await createChannel(event);
+
+    // ME
     if (method === 'GET' && rawPath === '/me') return await getMe(event);
-    
+
     return { statusCode: 404, body: JSON.stringify({ error: 'Not found' }) };
   } catch (err) {
     console.error(err);
-    const statusCode = err.message.includes('Forbidden') ? 403 : (err.message.includes('Authorization') ? 401 : 500);
-    return { statusCode, body: JSON.stringify({ error: err.message }) };
+    const msg = err.message || 'Internal error';
+    const statusCode = msg.includes('Forbidden')
+      ? 403
+      : msg.includes('Authorization')
+      ? 401
+      : 500;
+    return { statusCode, body: JSON.stringify({ error: msg }) };
   }
 };
+
+
+
+
+async function login(event) {
+  const { email, password } = JSON.parse(event.body || '{}');
+
+  if (!email || !password) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: 'email and password are required' }),
+    };
+  }
+
+  const cmd = new AdminInitiateAuthCommand({
+    UserPoolId: USER_POOL_ID,
+    ClientId: CLIENT_ID,
+    AuthFlow: 'ADMIN_USER_PASSWORD_AUTH',
+    AuthParameters: {
+      USERNAME: email,
+      PASSWORD: password,
+    },
+  });
+
+  const res = await cognito.send(cmd); // [web:2799]
+
+  if (res.ChallengeName === 'NEW_PASSWORD_REQUIRED') {
+    return {
+      statusCode: 200,
+      body: JSON.stringify({
+        challenge: 'NEW_PASSWORD_REQUIRED',
+        session: res.Session,
+      }),
+    };
+  }
+
+  const auth = res.AuthenticationResult;
+  if (!auth) {
+    return { statusCode: 401, body: JSON.stringify({ error: 'Authentication failed' }) };
+  }
+
+  return {
+    statusCode: 200,
+    body: JSON.stringify({
+      accessToken: auth.AccessToken,
+      idToken: auth.IdToken,
+      refreshToken: auth.RefreshToken,
+      expiresIn: auth.ExpiresIn,
+      tokenType: auth.TokenType,
+    }),
+  };
+}
+
+async function completeNewPassword(event) {
+  const { email, newPassword, session } = JSON.parse(event.body || '{}');
+
+  if (!email || !newPassword || !session) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: 'email, newPassword and session are required' }),
+    };
+  }
+
+  const cmd = new RespondToAuthChallengeCommand({
+    ClientId: CLIENT_ID,
+    ChallengeName: 'NEW_PASSWORD_REQUIRED',
+    Session: session,
+    ChallengeResponses: {
+      USERNAME: email,
+      NEW_PASSWORD: newPassword,
+    },
+  });
+
+  const res = await cognito.send(cmd); // [web:2771]
+
+  const auth = res.AuthenticationResult;
+  if (!auth) {
+    return { statusCode: 401, body: JSON.stringify({ error: 'Challenge failed' }) };
+  }
+
+  return {
+    statusCode: 200,
+    body: JSON.stringify({
+      accessToken: auth.AccessToken,
+      idToken: auth.IdToken,
+      refreshToken: auth.RefreshToken,
+      expiresIn: auth.ExpiresIn,
+      tokenType: auth.TokenType,
+    }),
+  };
+}

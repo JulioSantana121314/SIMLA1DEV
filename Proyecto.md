@@ -169,25 +169,48 @@ Behavior:
 
 ---
 
-## 9) MongoDB (planned collections)
+### 9) MongoDB (planned collections)
+
 ### 9.1 Core
+
 - `tenants`
-- `users` (may mirror Cognito userId + role + tenantId)
+- `users` (puede espejar Cognito userId + role + tenantId)
 - `channels`
 - `conversations`
 - `messages`
 
-### 9.2 Integrity & operations
-- `inbound_events` (raw + normalized metadata)
-- `processed_events` or unique index on `inbound_events` for idempotency
-- `outbox_send`
-- `send_log` (dedupe + audit)
-- `audit_log` / `system_ledger`
+...
 
-Indices (typical):
-- Unique `(tenantId, externalMessageId)` for messages.
-- Unique `(tenantId, channelId, externalThreadId)` for conversations.
-- Unique `(tenantId, outboxId)` or `(tenantId, sendId)` for outbound.
+---
+
+## 9) MongoDB (current dev setup)
+
+### 9.1 Cluster & database
+
+- MongoDB cluster: Atlas (shared) – dev.
+- Database name (dev): `kamsg` (nombre de producto). [web:2867]
+- Multi-tenant strategy: **un solo database** con colecciones compartidas filtradas por `tenantId`. [web:2845]
+
+### 9.2 Colección `channels` (implementada)
+
+Campos actuales:
+
+- `_id`: ObjectId
+- `tenantId`: string (derivado siempre del JWT `custom:tenantID`)
+- `type`: `"telegram" | "messenger"`
+- `displayName`: string
+- `externalId`: string
+- `credentials`: objeto genérico (p.ej. `{ botToken }`), pendiente de encriptar
+- `isActive`: boolean
+- `createdAt`: ISO string
+- `updatedAt`: ISO string
+
+Reglas:
+
+- `tenantId` **no** viene del body; siempre desde el token. [web:2845]
+- Solo roles `tenant_admin`, `tenant_manager` o `platform_admin` pueden crear canales.
+
+
 
 ---
 
@@ -232,19 +255,20 @@ MVP is done when:
 ---
 
 ## 13) Roadmap / next steps (implementation order)
-1) Create Cognito User Pool + `custom:tenantID` + role model (groups/claim).
-2) Build Tenant onboarding API:
-   - Create tenant
-   - Create first tenant admin user
-   - Create platform_admin bootstrap path
-3) Implement core Mongo models + indices for tenant isolation and idempotency.
-4) Implement `/tenant/channels` APIs:
-   - Create/rename/activate/deactivate
-   - Telegram connector (setWebhook/removeWebhook)
-   - Messenger connector (OAuth + page selection + webhook subscription)
-5) Implement normalized message contract + processor logic.
-6) Implement outbox + sender logic per channel.
-7) Build minimal admin UI later (not required now).
+1. Crear Cognito User Pool + `custom:tenantID` + role model (groups/claim). ✅ (dev)
+2. Construir Tenant onboarding API:
+   - Crear tenant
+   - Crear primer tenant admin user
+   - Crear ruta de bootstrap para platform_admin ✅ (endpoints `/platform/bootstrap`, `/platform/tenants`)
+3. Implementar core Mongo models + índices para tenant isolation e idempotencia.
+4. Implementar `/tenant/channels` APIs:
+   - **Create** ✅ (dev)
+   - rename/activate/deactivate (pendiente)
+   - Telegram connector (setWebhook/removeWebhook) (pendiente)
+   - Messenger connector (OAuth + page selection + webhook subscription) (pendiente)
+5. Implementar contrato normalizado de mensajes + lógica del processor.
+6. Implementar outbox + sender por canal.
+7. Construir UI admin mínima después (no requerido aún).
 
 ---
 
@@ -342,7 +366,16 @@ MVP is done when:
       "tenantId": "platform",
       "roles": ["platform_admin"]
     }
+  - Definido nombre de base de datos Mongo para dev: `kamsg`. [web:2867]
+  - Añadida conexión reutilizable a MongoDB Atlas en `kamshub-msg-dev-api` usando `MongoClient` y helpers `getDb()`. [web:2850][web:2854]
+  - Nuevas env vars en Lambda:
+    - `MONGODB_URI`
+    - `MONGODB_DB_NAME` = `kamsg`
+  - Implementado endpoint protegido `POST /tenant/channels`:
+  - Requiere JWT válido y roles `tenant_admin`, `tenant_manager` o `platform_admin`.
+  - Toma `type`, `displayName`, `externalId`, `credentials` del body.
+  - Inserta documento en colección `channels` con `tenantId` derivado del token.
+  - Devuelve `201` con `id` y datos del canal creado.
     ```
 
 
-    
