@@ -366,6 +366,49 @@ async function telegramWebhook(event) {
   };
 }
 
+async function sendTelegramMessage({ channel, conversation, text }) {
+  const botToken = channel.credentials?.botToken;
+  if (botToken.startsWith('TEST_')) {
+    return {
+      providerMessageId: null,
+      raw: { mocked: true },
+    };
+  }
+  if (!botToken) {
+    throw new Error('Telegram botToken not configured for channel');
+  }
+
+  const chatId = conversation.externalThreadId;
+  if (!chatId) {
+    throw new Error('Conversation missing externalThreadId for Telegram');
+  }
+
+  const body = {
+    chat_id: chatId,
+    text,
+  };
+
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    console.error('Telegram sendMessage error', res.status, errBody);
+    throw new Error(`Telegram sendMessage failed with ${res.status}`);
+  }
+
+  const data = await res.json();
+  // data.result.message_id es el providerMessageId
+  return {
+    providerMessageId: data.result?.message_id != null ? String(data.result.message_id) : null,
+    raw: data,
+  };
+}
+
+
 export const handler = async (event) => {
   const { rawPath, requestContext } = event;
   const method = requestContext?.http?.method || event.httpMethod;
@@ -387,6 +430,20 @@ export const handler = async (event) => {
     if (method === 'GET' && rawPath === '/tenant/conversations') {
       return await listConversations(event);
       }
+    if (method === 'GET' && rawPath.startsWith('/tenant/conversations/')) {
+      const match = rawPath.match(/^\/tenant\/conversations\/([a-fA-F0-9]{24})\/messages$/);
+      if (match) {
+        event.pathParameters = { conversationId: match[1] };
+        return await listConversationMessages(event);
+      }
+    }
+    if (method === 'POST' && rawPath.startsWith('/tenant/conversations/')) {
+      const match = rawPath.match(/^\/tenant\/conversations\/([a-fA-F0-9]{24})\/messages$/);
+      if (match) {
+        event.pathParameters = { conversationId: match[1] };
+        return await sendConversationMessage(event);
+      }
+    }
 
 
     return { statusCode: 404, body: JSON.stringify({ error: 'Not found' }) };
@@ -567,5 +624,185 @@ async function listConversations(event) {
   return {
     statusCode: 200,
     body: JSON.stringify({ items, nextCursor: null }),
+  };
+}
+
+
+async function listConversationMessages(event) {
+  const auth = await verifyJwt(event);
+
+  const db = await getDb();
+  const conversationsCol = getConversationsCollection(db);
+  const messagesCol = getMessagesCollection(db);
+  const { ObjectId } = await import('mongodb');
+
+  const conversationIdParam = event.pathParameters?.conversationId || null;
+  if (!conversationIdParam || !/^[a-fA-F0-9]{24}$/.test(conversationIdParam)) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: 'Invalid conversationId' }),
+    };
+  }
+
+  const conversationObjectId = new ObjectId(conversationIdParam);
+
+  // Validar que la conversación pertenece al tenant del token
+  const conversation = await conversationsCol.findOne({
+    _id: conversationObjectId,
+    tenantId: auth.tenantId,
+  });
+
+  if (!conversation) {
+    return {
+      statusCode: 404,
+      body: JSON.stringify({ error: 'Conversation not found' }),
+    };
+  }
+
+  const rawLimit = event.queryStringParameters?.limit || '50';
+  const limit = Math.min(Math.max(parseInt(rawLimit, 10) || 50, 1), 100);
+
+  const messages = await messagesCol
+    .find({
+      tenantId: auth.tenantId,
+      conversationId: conversation._id,
+    })
+    .sort({ createdAt: 1 }) // más antiguos primero, típico en chat
+    .limit(limit)
+    .toArray();
+
+  const items = messages.map((m) => ({
+    id: m._id.toString(),
+    tenantId: m.tenantId,
+    channelId: m.channelId,
+    conversationId: m.conversationId.toString(),
+    direction: m.direction,
+    provider: m.provider,
+    providerMessageId: m.providerMessageId,
+    text: m.text,
+    createdAt: m.createdAt,
+  }));
+
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ items, nextCursor: null }),
+  };
+}
+
+async function sendConversationMessage(event) {
+  const auth = await verifyJwt(event);
+
+  const db = await getDb();
+  const conversationsCol = getConversationsCollection(db);
+  const channelsCol = db.collection('channels');
+  const messagesCol = getMessagesCollection(db);
+  const { ObjectId } = await import('mongodb');
+
+  const conversationIdParam = event.pathParameters?.conversationId || null;
+  if (!conversationIdParam || !/^[a-fA-F0-9]{24}$/.test(conversationIdParam)) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: 'Invalid conversationId' }),
+    };
+  }
+
+  let body;
+  try {
+    body = JSON.parse(event.body || '{}');
+  } catch {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: 'Invalid JSON body' }),
+    };
+  }
+
+  const text = (body.text || '').trim();
+  if (!text) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: 'text is required' }),
+    };
+  }
+
+  const conversationObjectId = new ObjectId(conversationIdParam);
+
+  // 1) validar conversación del tenant
+  const conversation = await conversationsCol.findOne({
+    _id: conversationObjectId,
+    tenantId: auth.tenantId,
+  });
+
+  if (!conversation) {
+    return {
+      statusCode: 404,
+      body: JSON.stringify({ error: 'Conversation not found' }),
+    };
+  }
+
+  // 2) cargar canal
+  const channel = await channelsCol.findOne({
+    _id: new ObjectId(conversation.channelId),
+    tenantId: auth.tenantId,
+  });
+
+  if (!channel) {
+    return {
+      statusCode: 404,
+      body: JSON.stringify({ error: 'Channel not found for conversation' }),
+    };
+  }
+
+  // 3) enviar al proveedor (solo Telegram en esta fase)
+  let providerMessageId = null;
+  let rawResponse = null;
+
+  if (channel.type === 'telegram') {
+    const res = await sendTelegramMessage({
+      channel,
+      conversation,
+      text,
+    });
+    providerMessageId = res.providerMessageId;
+    rawResponse = res.raw;
+  } else {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: `Channel type ${channel.type} not supported for outbound yet` }),
+    };
+  }
+
+  // 4) persistir mensaje outbound
+  const now = new Date().toISOString();
+  const doc = {
+    tenantId: conversation.tenantId,
+    channelId: conversation.channelId,
+    conversationId: conversation._id,
+    direction: 'outbound',
+    provider: channel.type,
+    providerMessageId,
+    text,
+    raw: rawResponse,
+    createdAt: now,
+  };
+
+  const result = await messagesCol.insertOne(doc);
+
+  // 5) actualizar lastMessageAt de la conversación
+  await conversationsCol.updateOne(
+    { _id: conversation._id },
+    {
+      $set: {
+        lastMessageAt: now,
+        updatedAt: now,
+      },
+    },
+  );
+
+  return {
+    statusCode: 201,
+    body: JSON.stringify({
+      id: result.insertedId.toString(),
+      ...doc,
+    }),
   };
 }

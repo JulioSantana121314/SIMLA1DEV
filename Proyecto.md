@@ -582,3 +582,104 @@ El MVP se considera listo cuando:
     - Hilo `888888888` con preview `"Hola desde otro chat"`, `lastMessageAt` del mensaje `20`. [file:2971]
     - Hilo `999999999` con preview `"Segundo mensaje mismo chat"`, `lastMessageAt` del segundo mensaje del chat. [file:2971]
 
+- Nuevo endpoint protegido `GET /tenant/conversations/{id}/messages`:
+  - Path: `/tenant/conversations/{conversationId}/messages`.
+  - `conversationId` debe ser un ObjectId válido (24 hex). [web:2996]
+  - Valida que la conversación pertenezca al `tenantId` del token antes de devolver mensajes. [file:2656]
+  - Query en `messages`:
+    - Filtro: `{ tenantId, conversationId }`.
+    - Orden: `createdAt` ascendente (chat cronológico). [web:2990]
+    - `limit` (1–100, default 50).
+  - Respuesta:
+    ```json
+    {
+      "items": [
+        {
+          "id": "...",
+          "tenantId": "platform",
+          "channelId": "69606c369da01c080a4eaeae",
+          "conversationId": "6961a97849d938ef9264318d",
+          "direction": "inbound",
+          "provider": "telegram",
+          "providerMessageId": "10",
+          "text": "Hola desde Telegram (fake)",
+          "createdAt": "2026-01-10T01:39:03.030Z"
+        }
+      ],
+      "nextCursor": null
+    }
+    ```
+  - Ejemplo real (conversación `6961a97849d938ef9264318d`):
+    - Mensaje 1: `"Hola desde Telegram (fake)"`, `providerMessageId: "10"`.
+    - Mensaje 2: `"Segundo mensaje mismo chat"`, `providerMessageId: "11"`. [file:2971]
+
+
+    **Outbound messaging API (mock Telegram)**
+
+- Nuevo endpoint protegido `POST /tenant/conversations/{id}/messages`:
+  - Path: `/tenant/conversations/{conversationId}/messages`.
+  - Requiere IdToken válido (`custom:tenantID` del usuario) y valida que la conversación pertenezca a ese `tenantId`. [file:2656]
+  - Body:
+    ```json
+    {
+      "text": "Respuesta del agente desde API"
+    }
+    ```
+  - Valida:
+    - `conversationId` es ObjectId válido (24 hex). [web:2996]
+    - `text` no vacío (trim). [file:2656]
+
+- Flujo de envío (Fase 1, Telegram-only):
+  - Carga `conversation` por `_id` + `tenantId`. [file:2656]
+  - Carga `channel` por `conversation.channelId` + `tenantId`. [file:3002]
+  - Según `channel.type`:
+    - Si es `telegram`, llama a `sendTelegramMessage({ channel, conversation, text })`.
+    - Otros tipos responden `400` (`Channel type ... not supported for outbound yet`). [file:2656]
+
+- `sendTelegramMessage` (modo mock para dev):
+  - Obtiene `botToken` de `channel.credentials.botToken`. [file:3002]
+  - Si el token comienza con `TEST_` (o patrón de dummy configurado):
+    - No llama a la API de Telegram.
+    - Devuelve:
+      ```json
+      {
+        "providerMessageId": null,
+        "raw": { "mocked": true }
+      }
+      ```
+    - Permite probar end‑to‑end sin crear un bot real. [web:2926]
+  - (Para producción futura: usará `https://api.telegram.org/bot{botToken}/sendMessage` con `chat_id = externalThreadId`.) [web:2926]
+
+- Persistencia del mensaje outbound:
+  - Inserta en colección `messages`:
+    - `tenantId`: desde conversación.
+    - `channelId`: `conversation.channelId`.
+    - `conversationId`: `_id` de la conversación.
+    - `direction`: `"outbound"`.
+    - `provider`: `channel.type` (por ahora `"telegram"`).
+    - `providerMessageId`: valor devuelto por Telegram o `null` en mock.
+    - `text`: texto enviado.
+    - `raw`: respuesta cruda (`{ mocked: true }` en dev).
+    - `createdAt`: timestamp ISO actual. [file:2971]
+  - Devuelve `201` con:
+    ```json
+    {
+      "id": "<insertedId>",
+      "tenantId": "platform",
+      "channelId": "69606c369da01c080a4eaeae",
+      "conversationId": "6961a97849d938ef9264318d",
+      "direction": "outbound",
+      "provider": "telegram",
+      "providerMessageId": null,
+      "text": "Respuesta del agente desde API",
+      "raw": { "mocked": true },
+      "createdAt": "2026-01-10T02:44:58.346Z"
+    }
+    ```
+    (ejemplo real). [file:2971]
+
+- Efecto en inbox:
+  - `GET /tenant/conversations/{id}/messages` ahora devuelve mezcla de:
+    - Mensajes inbound (`direction: "inbound"`, `providerMessageId: "10"`, `"11"`).
+    - Mensajes outbound (`direction: "outbound"`, `providerMessageId: null` en mock). [file:2971]
+  - `GET /tenant/conversations` actualiza `lastMessageAt` de la conversación al enviar, por lo que las conversaciones con respuestas recientes aparecen arriba. [file:2970]
