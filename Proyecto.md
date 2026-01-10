@@ -279,3 +279,306 @@ Ejemplo de documento real creado:
   "createdAt": "2026-01-09T02:47:18.065Z",
   "updatedAt": "2026-01-09T02:47:18.065Z"
 }
+
+### 10) Platform operations
+
+### 10.1 Tenant lifecycle
+
+Tenant statuses:
+
+- `Active`
+- `Blocked`
+- `DeletionScheduled` (soft state + future purge)
+
+Deletion:
+
+- Grace period configurable (default 15 días); solo `platform_admin` puede cambiarlo. [file:2656]
+- Job de purge borra definitivamente data y credenciales del tenant, sin recalcular automáticamente `deleteAt` de tenants ya programados. [file:2656]
+
+### 10.2 Debug raw capture (per-tenant)
+
+Controlado solo por `platform_admin`. [file:2656]
+
+Campos:
+
+- `rawCaptureMode`: `off | sample | always`
+- `rawSampleRate` (solo si `sample`)
+- `rawTtlDays`
+- `rawAlwaysUntil` (auto-expire para `always`, máx. 72h) [file:2656]
+
+Reglas:
+
+- Cuando `rawCaptureMode = always` y `now > rawAlwaysUntil`, el sistema vuelve automáticamente a `off` (fallback). [file:2656]
+- Cambios se registran en un ledger/audit log (`TENANTDEBUGSETTINGSUPDATED`, `TENANTDEBUGSETTINGSAUTOEXPIRED`). [file:2656]
+
+---
+
+## 11) Environments
+
+Ambientes separados:
+
+- **staging** (no usuarios reales)  
+- **prod** (operación real) [file:2656]
+
+Notas:
+
+- Tenant `Testing` vive solo en staging para evitar contaminar prod. [file:2656]
+- Misma base de código; diferencias vía configuración (env vars, Mongo DB, dominios). [file:2656]
+
+---
+
+## 12) MVP definition (acceptance)
+
+El MVP se considera listo cuando:
+
+1. Multi-tenant auth funciona (usuarios con `custom:tenantID` y grupos en Cognito). [file:2656]
+2. Un tenant puede conectar **múltiples** Telegram bots y **múltiples** Messenger pages mediante `channels`. [file:2656]
+3. El sistema recibe mensajes inbound desde cualquier canal conectado (webhooks activos y persistencia en `messages`). [file:2656]
+4. El sistema envía mensajes outbound por el canal correcto (sender por canal usando outbox). [file:2656]
+5. Se preserva orden por conversación y los duplicados no generan efectos duplicados (idempotencia por `externalThreadId`/`providerMessageId`). [file:2656]
+6. Existen DLQs y redrive operables para eventos que fallan repetidamente. [file:2656]
+
+---
+
+## 13) Roadmap / next steps (implementation order)
+
+1. Crear Cognito User Pool + `custom:tenantID` + role model (groups/claim). ✅ (dev) [file:2656]
+2. Construir Tenant onboarding API: ✅ (dev)  
+   - Crear tenant  
+   - Crear primer tenant admin user  
+   - Crear ruta de bootstrap para `platform_admin` (`/platform/bootstrap`, `/platform/tenants`) [file:2656]
+3. Implementar core Mongo models + índices para tenant isolation e idempotencia (en progreso). [file:2656]
+4. Implementar `/tenant/channels` APIs: [file:2656]
+   - **Create** ✅ (dev)  
+   - Rename/activate/deactivate (pendiente)  
+   - Telegram connector (setWebhook/removeWebhook) (pendiente)  
+   - Messenger connector (OAuth + page selection + webhook subscription) (pendiente)
+5. Implementar contrato normalizado de mensajes + lógica del processor. [file:2656]
+6. Implementar outbox + sender por canal (incluyendo colas y reintentos). [file:2656]
+7. Construir UI admin mínima después (no requerido aún para MVP). [file:2656]
+
+---
+
+## 14) Changelog
+
+### 2025-12-31
+
+- Creado archivo de documentación vivo: alcance de MVP, footprint AWS dev, decisión multi-tenant + Cognito y roadmap. [file:2656]
+- Decidido usar **1 Cognito User Pool** compartido con `custom:tenantID` (usuario pertenece a un solo tenant) y roles iniciales sin asignación de chats por usuario. [file:2656]
+
+### 2026-01-07 – Cognito User Pool + Lambda API Bootstrap
+
+**Added**
+
+- **AWS Cognito User Pool** en `us-east-2`:
+  - User Pool ID: `us-east-2_B9izGWtvy`
+  - Client ID inicial: `6dv32jfp4vra4l3ttn5kqpm31d`
+  - Sign-in: Email + Username
+  - Self-registration: Disabled (solo `platform_admin` crea usuarios)
+  - Custom attribute: `custom:tenantID` (String, immutable, max 36 chars)
+  - Grupos: `platform_admin`, `tenant_admin`, `tenant_manager`
+  - Authentication flows: `ALLOW_USER_PASSWORD_AUTH`, `ALLOW_ADMIN_USER_PASSWORD_AUTH`, `ALLOW_REFRESH_TOKEN_AUTH`. [file:2656][web:2948]
+
+- **Lambda Function** `kamshub-msg-dev-api` (Node.js 24.x, us-east-2):
+  - Function URL: `https://5ewhj564xzelbmiusggtp6qiva0mvott.lambda-url.us-east-2.on.aws/` [file:2656]
+  - Endpoints:
+    - `POST /platform/bootstrap`: crea primer `platform_admin` (público, sin auth). [file:2656]
+    - `POST /platform/tenants`: crea tenant + `tenant_admin` (requiere `platform_admin`). [file:2656]
+    - `GET /me`: devuelve info del usuario autenticado (requiere JWT válido). [file:2656]
+  - Middleware JWT: verificación de **ID tokens** con `aws-jwt-verify`. [file:2656]
+  - Role-based authorization: `requireRole()` valida permisos por grupo. [file:2656]
+  - Username generation: `{emailPrefix}_{timestamp}` para evitar conflictos por alias de email. [file:2656]
+
+- **IAM Policy** para Lambda role:
+  - Permisos: `AdminCreateUser`, `AdminAddUserToGroup`, `AdminUpdateUserAttributes`, `DescribeUserPool`, `ListUsers`. [file:2656]
+  - Resource: `arn:aws:cognito-idp:us-east-2:856716755654:userpool/us-east-2_B9izGWtvy`. [file:2656]
+
+- **Dependencies** para Lambda:
+  - `aws-jwt-verify`
+  - `@aws-sdk/client-cognito-identity-provider` [file:2656]
+
+**Configuration**
+
+- Lambda timeout: 10s.  
+- Memory: 128 MB.  
+- Env vars: [file:2656]
+  - `COGNITO_USER_POOL_ID`: `us-east-2_B9izGWtvy`
+  - `COGNITO_CLIENT_ID`: `6dv32jfp4vra4l3ttn5kqpm31d` (luego actualizado, ver 2026-01-08)
+  - `AWS_REGION_COGNITO`: `us-east-2`
+
+**Security**
+
+- `custom:tenantID` immutable. [file:2656]
+- Function URL sin auth; auth manejada en código con verificación JWT. [file:2656]
+- Groups en ID token a través de claim `cognito:groups`. [file:2656]
+
+**Technical Notes**
+
+- Login con email; usernames generados programáticamente. [file:2656]
+- JWKS endpoint: `https://cognito-idp.us-east-2.amazonaws.com/us-east-2_B9izGWtvy/.well-known/jwks.json`. [file:2656]
+- Temporary passwords: generadas por `platform_admin`, usuarios deben cambiarlas en el primer login. [file:2656]
+- `MessageAction: SUPPRESS` (sin emails de bienvenida; MVP sin SES). [file:2656]
+
+**Next Steps (post 2026-01-07)**
+
+- [x] Crear primer `platform_admin` vía `/platform/bootstrap`. [file:2656]
+- [x] Implementar endpoint `POST /auth/login` (InitiateAuth flow). [file:2656]
+- [x] Implementar endpoint `POST /auth/complete-new-password` (NEW_PASSWORD_REQUIRED). [file:2656]
+- [ ] Agregar MongoDB para persistir tenants (plan inicial; ahora se usa para `channels`, `conversations`, `messages`). [file:2656]
+- [ ] Implementar CRUD de channels, templates, inbox.
+- [ ] Configurar SES (opcional prod).
+
+### 2026-01-08 – Cognito Auth Flow (DEV) + MongoDB `channels`
+
+- Creado app client **público sin secret**:
+  - Nombre: `kamshub-msg-dev-public`
+  - Client ID: `2ua96l1gdgjbaiil9kj798pvf` [file:2656]
+- Eliminados app clients obsoletos:
+  - `kamshub-msg-dev-client`
+  - `kamshub-msg-dev-client-nosecret` [file:2656]
+- Actualizada Lambda `kamshub-msg-dev-api`:
+  - Env var `COGNITO_CLIENT_ID` → `2ua96l1gdgjbaiil9kj798pvf` [file:2656]
+- Usuario admin (dev):
+  - Email: `admin@kamshub.online`
+  - Password dev: `NuevaPass123!`
+  - `custom:tenantID` = `platform`
+  - Grupo: `platform_admin` [file:2656]
+- Configuración MFA:
+  - MFA requerida deshabilitada en user pool para dev. [file:2656]
+- Flujo de autenticación:
+  - Login exitoso vía `ADMIN_USER_PASSWORD_AUTH`. [file:2656]
+  - Generación correcta de `AccessToken`, `IdToken`, `RefreshToken`. [file:2656]
+- Endpoint `/me`:
+  - Verificación JWT usando **IdToken** de Cognito.
+  - Respuesta actual de ejemplo:
+    ```json
+    {
+      "userId": "013b05d0-2051-7079-1f60-646b9c751779",
+      "email": "admin@kamshub.online",
+      "tenantId": "platform",
+      "roles": ["platform_admin"]
+    }
+    ``` [file:2656]
+- Base de datos Mongo para dev:
+  - `MONGODB_DB_NAME` = `kamsg` (o valor actualizado en env vars). [file:2656]
+  - Conexión reutilizable vía `MongoClient` y helper `getDb()`. [file:2656]
+- Endpoint protegido `POST /tenant/channels`:
+  - Requiere IdToken válido y roles `tenant_admin`, `tenant_manager` o `platform_admin`. [file:2656]
+  - Toma `type`, `displayName`, `externalId`, `credentials` del body. [file:2656]
+  - Inserta documento en colección `channels` con `tenantId` derivado del token. [file:2656]
+  - Devuelve `201` con `id` y datos del canal creado. [file:2656]
+
+### 2026-01-09 – Telegram webhook (DEV) + conversations/messages
+
+- Extendida Lambda `kamshub-msg-dev-api` para manejar webhooks de Telegram:
+  - Endpoint: `POST /webhooks/telegram/{channelId}` expuesto vía Function URL. [file:2656]
+  - `channelId` es el `_id` de un documento en `channels`. [file:2656]
+- Lógica de `telegramWebhook`:
+  - Valida path y resuelve `channel` por `_id` en colección `channels`. [file:2656]
+  - Obtiene `tenantId` desde el canal. [file:2656]
+  - Parsea `update` de Telegram, toma `message`/`edited_message` solo texto para Fase 1. [file:2656]
+  - Deriva:
+    - `externalThreadId` = `String(message.chat.id)`
+    - `providerMessageId` = `String(message.message_id)`
+    - `text` = `message.text || ''`
+    - `participants.externalUserId`, `participants.externalUsername` [file:2656]
+- `findOrCreateConversation`:
+  - Busca conversación existente por `(tenantId, channelId, externalThreadId)`. [file:2656]
+  - Si existe: actualiza `lastMessageAt`, `updatedAt` y devuelve el doc. [file:2656]
+  - Si no existe: inserta nueva conversación con `participants`, `createdAt`, `lastMessageAt`, `updatedAt` y devuelve el doc con `_id`. [file:2656]
+- `insertMessage`:
+  - Inserta en `messages`:
+    - `tenantId`, `channelId`, `conversationId`
+    - `direction: "inbound"`
+    - `provider: "telegram"`
+    - `providerMessageId`
+    - `text`
+    - `raw` = payload completo de Telegram
+    - `createdAt` [file:2656]
+- Ejemplo de prueba manual:
+  - `curl` a `POST /webhooks/telegram/{channelId}` con payload de `message` simple devuelve `{"ok": true}`. [file:2656]
+  - Se crea/actualiza una conversación en `conversations` y se inserta el mensaje correspondiente en `messages`. [file:2656]
+
+### 2026-01-09 – Telegram webhook (DEV) + conversations/messages + inbox read API
+
+**Added**
+
+- Extensión de `kamshub-msg-dev-api` para manejo de webhooks de Telegram:
+  - Endpoint: `POST /webhooks/telegram/{channelId}` expuesto vía Function URL. [file:2656]
+  - `channelId` es el `_id` del documento en `channels`. [file:2656]
+- Lógica de `telegramWebhook`:
+  - Valida path y resuelve `channel` por `_id` en colección `channels`. [file:2656]
+  - Obtiene `tenantId` desde el canal. [file:2656]
+  - Parsea `update` de Telegram, toma `message`/`edited_message` de texto para Fase 1. [file:2656]
+  - Deriva:
+    - `externalThreadId` = `String(message.chat.id)`
+    - `providerMessageId` = `String(message.message_id)`
+    - `text` = `message.text || ''`
+    - `participants.externalUserId`, `participants.externalUsername` [file:2656]
+
+- `findOrCreateConversation` (Mongo `conversations`):
+  - Busca conversación existente por `(tenantId, channelId, externalThreadId)`. [file:2656]
+  - Si existe: actualiza `lastMessageAt`, `updatedAt` y devuelve el documento. [file:2656]
+  - Si no existe: inserta nueva conversación con `participants`, `createdAt`, `lastMessageAt`, `updatedAt` y devuelve el documento con `_id`. [file:2656]
+
+- `insertMessage` (Mongo `messages`):
+  - Inserta documentos con:
+    - `tenantId`, `channelId`, `conversationId`
+    - `direction: "inbound"`
+    - `provider: "telegram"`
+    - `providerMessageId`
+    - `text`
+    - `raw` = payload completo de Telegram
+    - `createdAt` [file:2656]
+
+- Pruebas manuales con `curl`:
+  - Mensaje inicial desde `chat.id = 999999999` (`providerMessageId: "10"`). [file:2971]
+  - Segundo mensaje mismo chat (`providerMessageId: "11"`), reutilizando la misma conversación. [file:2971]
+  - Mensaje desde otro `chat.id = 888888888` (`providerMessageId: "20"`), creando una segunda conversación. [file:2970]
+  - Todas las invocaciones devuelven `{"ok": true}`. [file:2971]
+
+- Estructura en MongoDB (ejemplos reales):
+  - `conversations`:
+    - Doc 1: `tenantId: "platform"`, `channelId: "69606c369da01c080a4eaeae"`, `externalThreadId: "999999999"`, `participants` de `john_doe`. [file:2970]
+    - Doc 2: `tenantId: "platform"`, mismo `channelId`, `externalThreadId: "888888888"`, `participants` de `alice_demo`. [file:2970]
+  - `messages`:
+    - Tres mensajes inbound con `providerMessageId` `"10"`, `"11"`, `"20"` apuntando a los `conversationId` correctos. [file:2971]
+
+**Inbox read API**
+
+- Nuevo endpoint protegido `GET /tenant/conversations`:
+  - Requiere IdToken válido y usa `auth.tenantId` desde `custom:tenantID`. [file:2656]
+  - Query en `conversations`:
+    - Filtra por `tenantId`.
+    - Ordena por `lastMessageAt` descendente.
+    - Limita por `limit` (1–100, default 20). [file:2656]
+  - Enriquecimiento con `channels`:
+    - Busca `channels._id IN channelId[]` y proyecta `type`, `displayName`. [file:2656]
+  - Cálculo de `lastMessagePreview`:
+    - Pipeline en `messages`:
+      - `match` por `tenantId` y `conversationId IN []`
+      - `sort { createdAt: -1 }`
+      - `group` por `conversationId` tomando primer `text` y `createdAt`. [file:2972][web:2974]
+  - Mapeo de respuesta:
+    - Para cada conversación:
+      - `id`, `tenantId`
+      - `channel { id, type, displayName }`
+      - `externalThreadId`
+      - `participants`
+      - `lastMessagePreview` (texto del último mensaje o `null`)
+      - `lastMessageAt` (de conversación o último mensaje)
+      - `createdAt`, `updatedAt`
+      - `unreadCount: 0` (placeholder) [file:2971]
+    - Estructura final:
+      ```json
+      {
+        "items": [...],
+        "nextCursor": null
+      }
+      ```
+
+- Ejemplo real de respuesta (`admin@kamshub.online` con tenant `platform`):
+  - Dos conversaciones devueltas:
+    - Hilo `888888888` con preview `"Hola desde otro chat"`, `lastMessageAt` del mensaje `20`. [file:2971]
+    - Hilo `999999999` con preview `"Segundo mensaje mismo chat"`, `lastMessageAt` del segundo mensaje del chat. [file:2971]
+

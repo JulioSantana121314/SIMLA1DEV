@@ -28,11 +28,18 @@ async function getDb() {
   }
 
   mongoClient = new MongoClient(MONGODB_URI);
-  await mongoClient.connect(); // se reutiliza entre invocaciones en Lambda [web:2854][web:2859]
+  await mongoClient.connect();
   mongoDb = mongoClient.db(MONGODB_DB_NAME);
   return mongoDb;
 }
 
+function getConversationsCollection(db) {
+  return db.collection('conversations');
+}
+
+function getMessagesCollection(db) {
+  return db.collection('messages');
+}
 
 const verifier = CognitoJwtVerifier.create({
   userPoolId: USER_POOL_ID,
@@ -45,10 +52,10 @@ async function verifyJwt(event) {
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     throw new Error('Missing or invalid Authorization header');
   }
-  
+
   const token = authHeader.substring(7);
   const payload = await verifier.verify(token);
-  
+
   return {
     userId: payload.sub,
     email: payload.email,
@@ -58,72 +65,80 @@ async function verifyJwt(event) {
 }
 
 function requireRole(auth, allowedRoles) {
-  if (!auth.roles.some(r => allowedRoles.includes(r))) {
+  if (!auth.roles.some((r) => allowedRoles.includes(r))) {
     throw new Error('Forbidden: insufficient role');
   }
 }
 
 async function bootstrap(event) {
   const { email, tempPassword } = JSON.parse(event.body);
-  
-  // Generar username alfanumérico único
+
   const username = email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '') + '_' + Date.now();
-  
-  await cognito.send(new AdminCreateUserCommand({
-    UserPoolId: USER_POOL_ID,
-    Username: username,
-    UserAttributes: [
-      { Name: 'email', Value: email },
-      { Name: 'email_verified', Value: 'true' },
-      { Name: 'custom:tenantID', Value: 'platform' },
-    ],
-    TemporaryPassword: tempPassword,
-    MessageAction: 'SUPPRESS',
-  }));
-  
-  await cognito.send(new AdminAddUserToGroupCommand({
-    UserPoolId: USER_POOL_ID,
-    Username: username,
-    GroupName: 'platform_admin',
-  }));
-  
-  return { statusCode: 201, body: JSON.stringify({ ok: true, message: 'Platform admin created', email, username }) };
+
+  await cognito.send(
+    new AdminCreateUserCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: username,
+      UserAttributes: [
+        { Name: 'email', Value: email },
+        { Name: 'email_verified', Value: 'true' },
+        { Name: 'custom:tenantID', Value: 'platform' },
+      ],
+      TemporaryPassword: tempPassword,
+      MessageAction: 'SUPPRESS',
+    }),
+  );
+
+  await cognito.send(
+    new AdminAddUserToGroupCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: username,
+      GroupName: 'platform_admin',
+    }),
+  );
+
+  return {
+    statusCode: 201,
+    body: JSON.stringify({ ok: true, message: 'Platform admin created', email, username }),
+  };
 }
 
 async function createTenant(event) {
   const auth = await verifyJwt(event);
   requireRole(auth, ['platform_admin']);
-  
+
   const { tenantName, adminEmail, tempPassword } = JSON.parse(event.body);
   const tenantId = randomUUID();
-  
-  // Generar username alfanumérico único
+
   const username = adminEmail.split('@')[0].replace(/[^a-zA-Z0-9]/g, '') + '_' + Date.now();
-  
-  await cognito.send(new AdminCreateUserCommand({
-    UserPoolId: USER_POOL_ID,
-    Username: username,
-    UserAttributes: [
-      { Name: 'email', Value: adminEmail },
-      { Name: 'email_verified', Value: 'true' },
-      { Name: 'custom:tenantID', Value: tenantId },
-    ],
-    TemporaryPassword: tempPassword,
-    MessageAction: 'SUPPRESS',
-  }));
-  
-  await cognito.send(new AdminAddUserToGroupCommand({
-    UserPoolId: USER_POOL_ID,
-    Username: username,
-    GroupName: 'tenant_admin',
-  }));
-  
+
+  await cognito.send(
+    new AdminCreateUserCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: username,
+      UserAttributes: [
+        { Name: 'email', Value: adminEmail },
+        { Name: 'email_verified', Value: 'true' },
+        { Name: 'custom:tenantID', Value: tenantId },
+      ],
+      TemporaryPassword: tempPassword,
+      MessageAction: 'SUPPRESS',
+    }),
+  );
+
+  await cognito.send(
+    new AdminAddUserToGroupCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: username,
+      GroupName: 'tenant_admin',
+    }),
+  );
+
   return { statusCode: 201, body: JSON.stringify({ ok: true, tenantId, adminEmail, username }) };
 }
 
 async function createChannel(event) {
   const auth = await verifyJwt(event);
-  // Solo tenants y plataforma pueden crear canales
   requireRole(auth, ['tenant_admin', 'tenant_manager', 'platform_admin']);
 
   const { type, displayName, externalId, credentials } = JSON.parse(event.body || '{}');
@@ -147,17 +162,17 @@ async function createChannel(event) {
 
   const now = new Date().toISOString();
   const doc = {
-    tenantId: auth.tenantId,          // siempre desde el token, nunca del body [web:2845]
+    tenantId: auth.tenantId,
     type,
     displayName,
     externalId,
-    credentials,                      // TODO: encriptar en siguiente iteración
+    credentials,
     isActive: true,
     createdAt: now,
     updatedAt: now,
   };
 
-  const result = await channels.insertOne(doc); // [web:2850][web:2862]
+  const result = await channels.insertOne(doc);
 
   return {
     statusCode: 201,
@@ -168,6 +183,79 @@ async function createChannel(event) {
   };
 }
 
+async function findOrCreateConversation({ tenantId, channelId, externalThreadId, participants = {} }) {
+  const db = await getDb();
+  const conversations = getConversationsCollection(db);
+
+  const now = new Date().toISOString();
+
+  // 1) intentar encontrar conversación existente
+  let conversation = await conversations.findOne({
+    tenantId,
+    channelId,
+    externalThreadId,
+  });
+
+  if (conversation) {
+    await conversations.updateOne(
+      { _id: conversation._id },
+      {
+        $set: {
+          lastMessageAt: now,
+          updatedAt: now,
+        },
+      },
+    );
+    return conversation;
+  }
+
+  // 2) crear nueva conversación
+  const doc = {
+    tenantId,
+    channelId,
+    externalThreadId,
+    participants,
+    lastMessageAt: now,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const result = await conversations.insertOne(doc);
+  doc._id = result.insertedId;
+  return doc;
+}
+
+async function insertMessage({
+  tenantId,
+  channelId,
+  conversationId,
+  direction,
+  provider,
+  providerMessageId,
+  text,
+  raw,
+}) {
+  const db = await getDb();
+  const messages = getMessagesCollection(db);
+
+  const now = new Date().toISOString();
+
+  const doc = {
+    tenantId,
+    channelId,
+    conversationId,
+    direction,
+    provider,
+    providerMessageId,
+    text,
+    raw: raw || null,
+    createdAt: now,
+  };
+
+  await messages.insertOne(doc);
+
+  return doc;
+}
 
 async function getMe(event) {
   const auth = await verifyJwt(event);
@@ -182,44 +270,133 @@ async function getMe(event) {
   };
 }
 
+async function telegramWebhook(event) {
+  const { rawPath } = event;
+
+  const match = rawPath.match(/^\/webhooks\/telegram\/([a-fA-F0-9]{24})$/);
+  if (!match) {
+    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid Telegram webhook path' }) };
+  }
+
+  const channelId = match[1];
+
+  const db = await getDb();
+  const channels = db.collection('channels');
+
+  const { ObjectId } = await import('mongodb');
+  const channel = await channels.findOne({ _id: new ObjectId(channelId) });
+
+  if (!channel) {
+    return { statusCode: 404, body: JSON.stringify({ error: 'Channel not found' }) };
+  }
+
+  const tenantId = channel.tenantId;
+
+  let update;
+  try {
+    update = JSON.parse(event.body || '{}');
+  } catch (e) {
+    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON body' }) };
+  }
+
+  const message = update.message || update.edited_message;
+  if (!message) {
+    return { statusCode: 200, body: JSON.stringify({ ok: true, ignored: true }) };
+  }
+
+  const externalThreadId = String(message.chat?.id ?? '');
+  const providerMessageId = String(message.message_id ?? '');
+  const text = message.text || '';
+
+  if (!externalThreadId || !providerMessageId) {
+    return { statusCode: 400, body: JSON.stringify({ error: 'Missing chat.id or message_id in Telegram payload' }) };
+  }
+
+  const participants = {
+    externalUserId: message.from?.id ? String(message.from.id) : undefined,
+    externalUsername: message.from?.username || undefined,
+  };
+
+  console.log('TG WEBHOOK - findOrCreateConversation input', {
+    tenantId,
+    channelId,
+    externalThreadId,
+    participants,
+  });
+
+  const conversation = await findOrCreateConversation({
+    tenantId,
+    channelId: channelId,
+    externalThreadId,
+    participants,
+  });
+
+  console.log(
+    'TG WEBHOOK - conversation result',
+    conversation && {
+      _id: conversation._id,
+      tenantId: conversation.tenantId,
+      channelId: conversation.channelId,
+      externalThreadId: conversation.externalThreadId,
+    },
+  );
+
+  if (!conversation || !conversation._id) {
+    console.error('TG WEBHOOK - conversation has no _id', conversation);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: 'Conversation missing _id' }),
+    };
+  }
+
+  await insertMessage({
+    tenantId,
+    channelId: channelId,
+    conversationId: conversation._id,
+    direction: 'inbound',
+    provider: 'telegram',
+    providerMessageId,
+    text,
+    raw: update,
+  });
+
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ ok: true }),
+  };
+}
+
 export const handler = async (event) => {
   const { rawPath, requestContext } = event;
   const method = requestContext?.http?.method || event.httpMethod;
 
   try {
-    // AUTH
     if (method === 'POST' && rawPath === '/auth/login') {
       return await login(event);
     }
     if (method === 'POST' && rawPath === '/auth/complete-new-password') {
       return await completeNewPassword(event);
     }
-
-    // PLATFORM
     if (method === 'POST' && rawPath === '/platform/bootstrap') return await bootstrap(event);
     if (method === 'POST' && rawPath === '/platform/tenants') return await createTenant(event);
-
-    // TENANT
     if (method === 'POST' && rawPath === '/tenant/channels') return await createChannel(event);
-
-    // ME
+    if (method === 'POST' && rawPath.startsWith('/webhooks/telegram/')) {
+      return await telegramWebhook(event);
+      }
     if (method === 'GET' && rawPath === '/me') return await getMe(event);
+    if (method === 'GET' && rawPath === '/tenant/conversations') {
+      return await listConversations(event);
+      }
+
 
     return { statusCode: 404, body: JSON.stringify({ error: 'Not found' }) };
   } catch (err) {
     console.error(err);
     const msg = err.message || 'Internal error';
-    const statusCode = msg.includes('Forbidden')
-      ? 403
-      : msg.includes('Authorization')
-      ? 401
-      : 500;
+    const statusCode = msg.includes('Forbidden') ? 403 : msg.includes('Authorization') ? 401 : 500;
     return { statusCode, body: JSON.stringify({ error: msg }) };
   }
 };
-
-
-
 
 async function login(event) {
   const { email, password } = JSON.parse(event.body || '{}');
@@ -241,7 +418,7 @@ async function login(event) {
     },
   });
 
-  const res = await cognito.send(cmd); // [web:2799]
+  const res = await cognito.send(cmd);
 
   if (res.ChallengeName === 'NEW_PASSWORD_REQUIRED') {
     return {
@@ -290,7 +467,7 @@ async function completeNewPassword(event) {
     },
   });
 
-  const res = await cognito.send(cmd); // [web:2771]
+  const res = await cognito.send(cmd);
 
   const auth = res.AuthenticationResult;
   if (!auth) {
@@ -306,5 +483,89 @@ async function completeNewPassword(event) {
       expiresIn: auth.ExpiresIn,
       tokenType: auth.TokenType,
     }),
+  };
+}
+
+async function listConversations(event) {
+  const auth = await verifyJwt(event);
+
+  const db = await getDb();
+  const conversationsCol = getConversationsCollection(db);
+  const channelsCol = db.collection('channels');
+  const messagesCol = getMessagesCollection(db);
+  const { ObjectId } = await import('mongodb');
+
+  const rawLimit = event.queryStringParameters?.limit || '20';
+  const limit = Math.min(Math.max(parseInt(rawLimit, 10) || 20, 1), 100);
+
+  const conversations = await conversationsCol
+    .find({ tenantId: auth.tenantId })
+    .sort({ lastMessageAt: -1 })
+    .limit(limit)
+    .toArray();
+
+  if (!conversations.length) {
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ items: [], nextCursor: null }),
+    };
+  }
+
+  const channelIds = [...new Set(conversations.map((c) => c.channelId))];
+  const channels = await channelsCol
+    .find({ _id: { $in: channelIds.map((id) => new ObjectId(id)) } })
+    .project({ type: 1, displayName: 1 })
+    .toArray();
+  const channelById = new Map(channels.map((ch) => [ch._id.toString(), ch]));
+
+  const conversationIds = conversations.map((c) => c._id);
+  const lastMessages = await messagesCol
+    .aggregate([
+      { $match: { tenantId: auth.tenantId, conversationId: { $in: conversationIds } } },
+      { $sort: { createdAt: -1 } },
+      {
+        $group: {
+          _id: '$conversationId',
+          text: { $first: '$text' },
+          createdAt: { $first: '$createdAt' },
+        },
+      },
+    ])
+    .toArray();
+  const lastMessageByConvId = new Map(
+    lastMessages.map((m) => [m._id.toString(), m]),
+  );
+
+  const items = conversations.map((c) => {
+    const ch = channelById.get(c.channelId.toString());
+    const lastMsg = lastMessageByConvId.get(c._id.toString());
+
+    return {
+      id: c._id.toString(),
+      tenantId: c.tenantId,
+      channel: ch
+        ? {
+            id: c.channelId,
+            type: ch.type,
+            displayName: ch.displayName,
+          }
+        : {
+            id: c.channelId,
+            type: null,
+            displayName: null,
+          },
+      externalThreadId: c.externalThreadId,
+      participants: c.participants || {},
+      lastMessagePreview: lastMsg?.text || null,
+      lastMessageAt: c.lastMessageAt || lastMsg?.createdAt || null,
+      createdAt: c.createdAt,
+      updatedAt: c.updatedAt,
+      unreadCount: 0,
+    };
+  });
+
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ items, nextCursor: null }),
   };
 }
