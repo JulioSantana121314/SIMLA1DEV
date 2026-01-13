@@ -683,3 +683,116 @@ El MVP se considera listo cuando:
     - Mensajes inbound (`direction: "inbound"`, `providerMessageId: "10"`, `"11"`).
     - Mensajes outbound (`direction: "outbound"`, `providerMessageId: null` en mock). [file:2971]
   - `GET /tenant/conversations` actualiza `lastMessageAt` de la conversación al enviar, por lo que las conversaciones con respuestas recientes aparecen arriba. [file:2970]
+
+
+### 2026-01-13 – Telegram Bot Real + End-to-End Flow
+
+**Added**
+
+- Bot real de Telegram creado con BotFather:
+  - Bot username: `@kamshub_support_bot`
+  - Bot token guardado en `channels.credentials.botToken` (dev) [file:3013]
+  
+- Webhook configurado:
+  - URL: `https://5ewhj564xzelbmiusggtp6qiva0mvott.lambda-url.us-east-2.on.aws/webhooks/telegram/69606c369da01c080a4eaeae`
+  - Configurado con `setWebhook` de Telegram API [web:2907]
+  - Estado: activo y recibiendo mensajes
+
+**Validated**
+
+- Flujo inbound real:
+  - Mensaje enviado desde Telegram → webhook recibido → conversación creada en MongoDB
+  - `externalThreadId` real capturado (`7759377832`)
+  - Participants correctamente guardados [file:3014]
+
+- Flujo outbound real:
+  - `POST /tenant/conversations/{id}/messages` con `botToken` real
+  - Mensaje enviado exitosamente a Telegram vía `sendMessage` API
+  - `providerMessageId` real devuelto (no mock) [web:2926][file:3014]
+
+**Technical Notes**
+
+- Función `sendTelegramMessage` detecta tokens mock (`TEST_*`) vs reales
+- Token real activa llamada a `https://api.telegram.org/bot{token}/sendMessage`
+- `chat_id` derivado de `conversation.externalThreadId` [file:2656]
+
+### 2026-01-13 – Telegram Bot Real + End-to-End Validation
+
+**Added**
+
+- Bot real de Telegram creado con BotFather:
+  - Bot name: `Kamshub Support`
+  - Bot username: `@kamshub_support_bot`
+  - Bot ID: `8572472362` [file:3014]
+  
+- Canal actualizado en MongoDB:
+  - `_id`: `69606c369da01c080a4eaeae`
+  - `tenantId`: `platform`
+  - `type`: `telegram`
+  - `displayName`: actualizado a nombre descriptivo
+  - `externalId`: `kamshub_support_bot`
+  - `credentials.botToken`: token real guardado (dev) [file:3013]
+  - `isActive`: `true`
+  
+- Webhook de Telegram configurado:
+  - URL: `https://5ewhj564xzelbmiusggtp6qiva0mvott.lambda-url.us-east-2.on.aws/webhooks/telegram/69606c369da01c080a4eaeae`
+  - Método: `setWebhook` vía Telegram Bot API
+  - Estado verificado con `getWebhookInfo`: activo y sin errores pendientes [web:2907]
+
+**Validated (End-to-End Flow)**
+
+- **Inbound real (Telegram → Lambda → MongoDB)**:
+  - Usuario real (`@tatianaBiz0`, chat_id `7759377832`) envió `/start` al bot
+  - Webhook recibido en Lambda correctamente
+  - Conversación creada automáticamente en `conversations`:
+    - `externalThreadId`: `"7759377832"` (chat_id del usuario)
+    - `participants.externalUserId`: `"7759377832"`
+    - `participants.externalUsername`: `"tatianaBiz0"`
+    - `channelId`: `"69606c369da01c080a4eaeae"`
+  - Mensaje guardado en `messages` con `direction: "inbound"`, `providerMessageId` real [file:3014]
+
+- **Inbox read API**:
+  - `GET /tenant/conversations` devuelve conversación real con preview correcto
+  - `lastMessagePreview`: `/start`
+  - `lastMessageAt`: timestamp real del mensaje recibido [file:2971]
+
+- **Outbound real (API → Telegram)**:
+  - `POST /tenant/conversations/{id}/messages` con token real (no mock)
+  - Función `sendTelegramMessage` llamó a `https://api.telegram.org/bot.../sendMessage`
+  - Mensaje enviado exitosamente: *"¡Hola! Este es un mensaje automático desde la API de Kamshub 🚀"*
+  - Mensaje **recibido en chat de Telegram** por el usuario
+  - `providerMessageId` real devuelto (no `null`) [web:2926][file:3014]
+
+**Technical Notes**
+
+- Un bot de Telegram puede manejar **múltiples conversaciones simultáneas**:
+  - Cada usuario tiene un `chat.id` único (el `externalThreadId`)
+  - Un solo canal (`channelId`) puede tener N conversaciones
+  - Aislamiento garantizado por índice único `(tenantId, channelId, externalThreadId)` [file:3004]
+  
+- Para múltiples bots por tenant:
+  - Crear bot adicional en BotFather
+  - Insertar nuevo documento en `channels` con `botToken` diferente
+  - Configurar webhook con nuevo `channelId`
+  - Cada bot opera independientemente [web:3006]
+
+- Función `sendTelegramMessage` diferencia tokens:
+  - Si `botToken` empieza con `TEST_`: modo mock (no llama API)
+  - Si no: llama a Telegram API real con `chat_id` de `conversation.externalThreadId` [file:2656]
+
+**Security & Operations**
+
+- Token del bot guardado en MongoDB (dev):
+  - ⚠️ Para producción: migrar a AWS Secrets Manager o encriptar en MongoDB
+  - Token nunca debe exponerse en logs o repos públicos [web:3010][web:3012]
+
+- Webhook verification:
+  - `getWebhookInfo` confirma URL configurada y `pending_update_count: 0`
+  - CloudWatch Logs en `/aws/lambda/kamshub-msg-dev-api` para debugging [web:2907]
+
+**Next Steps (Post Bot Real)**
+
+- [ ] Spec de UI mínima (inbox + chat view)
+- [ ] Agregar Meta Messenger como segundo canal
+- [ ] Implementar outbox + retry logic con SQS
+- [ ] Migrar tokens a Secrets Manager (prod)
