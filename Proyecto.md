@@ -796,3 +796,78 @@ El MVP se considera listo cuando:
 - [ ] Agregar Meta Messenger como segundo canal
 - [ ] Implementar outbox + retry logic con SQS
 - [ ] Migrar tokens a Secrets Manager (prod)
+
+### 2026-01-13 – UI Spec / Wireframes (Inbox + Chat)
+
+**Objective**
+
+Define las pantallas principales del MVP y validar que los endpoints actuales proporcionan todos los campos necesarios para la UI, sin escribir código de frontend todavía.
+
+**Screens Defined**
+
+1. **Inbox / Lista de conversaciones** (`/inbox`)
+   - Card por conversación con:
+     - Icono del canal (🟦 telegram, 💬 messenger)
+     - Nombre del canal (`channel.displayName`)
+     - Participante (`participants[0].externalUsername`)
+     - Preview último mensaje (`lastMessagePreview`, truncado ~50 chars)
+     - Timestamp humanizado (`lastMessageAt`: "2 hours ago", "Yesterday")
+     - Badge de no leídos (`unreadCount`, destacado si > 0)
+   - Ordenado por `lastMessageAt` desc
+   - Click en card → navega a `/conversations/{id}`
+   - Endpoint: `GET /tenant/conversations`
+
+2. **Vista de conversación / Chat** (`/conversations/{id}`)
+   - Header:
+     - Icono + tipo + nombre del canal
+     - Username del participante + Chat ID (`externalThreadId`)
+   - Mensajes:
+     - Burbujas izquierda (`direction: inbound`, gris)
+     - Burbujas derecha (`direction: outbound`, azul)
+     - Texto + timestamp (`createdAt` formato hora)
+     - Auto-scroll al último mensaje
+   - Input:
+     - Textarea "Type a message..."
+     - Botón "Send" (disabled si vacío)
+     - Optimistic update al enviar
+   - Endpoints:
+     - `GET /tenant/conversations/{id}/messages` (historial)
+     - `POST /tenant/conversations/{id}/messages` (enviar)
+
+3. **Header de conversación**
+   - Datos incluidos en response de `GET /conversations/{id}/messages`
+   - `conversation.channel.{type, displayName}`
+   - `conversation.participants[0].externalUsername`
+   - `conversation.externalThreadId`
+
+**Field Validation**
+
+| Elemento UI | Campo API | Estado |
+|------------|-----------|--------|
+| Icono canal | `channel.type` | ✅ Disponible |
+| Nombre canal | `channel.displayName` | ✅ Disponible |
+| Badge no leídos | `unreadCount` | ⚠️ Placeholder (siempre 0) |
+| Participante | `participants[0].externalUsername` | ✅ Disponible |
+| Preview mensaje | `lastMessagePreview` | ✅ Disponible |
+| Timestamp conversación | `lastMessageAt` | ✅ Disponible |
+| Lista mensajes | `items[]` | ✅ Disponible |
+| Texto mensaje | `text` | ✅ Disponible |
+| Dirección mensaje | `direction` | ✅ Disponible |
+| Timestamp mensaje | `createdAt` | ✅ Disponible |
+| Chat ID externo | `externalThreadId` | ✅ Disponible |
+
+**Gaps Identified (Non-blocking for MVP)**
+
+- `unreadCount` es placeholder: requiere tracking de "último mensaje leído por agente"
+- No hay estado de entrega de mensajes outbound (pending, delivered, read, failed)
+- Paginación de mensajes: `nextCursor` siempre `null` (funciona para pocas conversaciones)
+
+**Decision**
+
+Todos los campos críticos están disponibles en los endpoints actuales. La UI puede implementarse completamente con la API existente. Los gaps documentados se implementarán post-MVP cuando haya tráfico real.
+
+**Next Steps**
+
+- [ ] Agregar Meta Messenger como segundo canal
+- [ ] Implementar frontend (React/Vue) con estos contratos
+- [ ] Post-MVP: tracking de lectura para `unreadCount` real
