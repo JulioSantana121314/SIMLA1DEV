@@ -20,6 +20,23 @@ console.log('ENV', { USER_POOL_ID, CLIENT_ID, MONGODB_URI_PRESENT: !!MONGODB_URI
 let mongoClient;
 let mongoDb;
 
+// CORS headers helper
+function corsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+  };
+}
+
+function corsResponse(statusCode, body) {
+  return {
+    statusCode,
+    headers: corsHeaders(),
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  };
+}
+
 async function getDb() {
   if (mongoDb) return mongoDb;
 
@@ -54,15 +71,25 @@ async function verifyJwt(event) {
   }
 
   const token = authHeader.substring(7);
-  const payload = await verifier.verify(token);
 
-  return {
-    userId: payload.sub,
-    email: payload.email,
-    tenantId: payload['custom:tenantID'] || null,
-    roles: payload['cognito:groups'] || [],
-  };
+  try {
+    const payload = await verifier.verify(token);
+
+    return {
+      userId: payload.sub,
+      email: payload.email,
+      tenantId: payload['custom:tenantID'] || null,
+      roles: payload['cognito:groups'] || [],
+    };
+  } catch (error) {
+    console.error('JWT verification failed:', error.message);
+    // Lanzar error de autorización, no dejar que se propague el error original
+    const authError = new Error('Invalid or expired token');
+    authError.statusCode = 401; // Marcar como 401
+    throw authError;
+  }
 }
+
 
 function requireRole(auth, allowedRoles) {
   if (!auth.roles.some((r) => allowedRoles.includes(r))) {
@@ -97,10 +124,7 @@ async function bootstrap(event) {
     }),
   );
 
-  return {
-    statusCode: 201,
-    body: JSON.stringify({ ok: true, message: 'Platform admin created', email, username }),
-  };
+  return corsResponse(201, { ok: true, message: 'Platform admin created', email, username });
 }
 
 async function createTenant(event) {
@@ -134,7 +158,7 @@ async function createTenant(event) {
     }),
   );
 
-  return { statusCode: 201, body: JSON.stringify({ ok: true, tenantId, adminEmail, username }) };
+  return corsResponse(201, { ok: true, tenantId, adminEmail, username });
 }
 
 async function createChannel(event) {
@@ -144,17 +168,11 @@ async function createChannel(event) {
   const { type, displayName, externalId, credentials } = JSON.parse(event.body || '{}');
 
   if (!type || !displayName || !externalId || !credentials) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'type, displayName, externalId and credentials are required' }),
-    };
+    return corsResponse(400, { error: 'type, displayName, externalId and credentials are required' });
   }
 
   if (!['telegram', 'messenger'].includes(type)) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'type must be telegram or messenger' }),
-    };
+    return corsResponse(400, { error: 'type must be telegram or messenger' });
   }
 
   const db = await getDb();
@@ -174,13 +192,10 @@ async function createChannel(event) {
 
   const result = await channels.insertOne(doc);
 
-  return {
-    statusCode: 201,
-    body: JSON.stringify({
-      id: result.insertedId.toString(),
-      ...doc,
-    }),
-  };
+  return corsResponse(201, {
+    id: result.insertedId.toString(),
+    ...doc,
+  });
 }
 
 async function findOrCreateConversation({ tenantId, channelId, externalThreadId, participants = {} }) {
@@ -189,7 +204,6 @@ async function findOrCreateConversation({ tenantId, channelId, externalThreadId,
 
   const now = new Date().toISOString();
 
-  // 1) intentar encontrar conversación existente
   let conversation = await conversations.findOne({
     tenantId,
     channelId,
@@ -209,7 +223,6 @@ async function findOrCreateConversation({ tenantId, channelId, externalThreadId,
     return conversation;
   }
 
-  // 2) crear nueva conversación
   const doc = {
     tenantId,
     channelId,
@@ -259,15 +272,12 @@ async function insertMessage({
 
 async function getMe(event) {
   const auth = await verifyJwt(event);
-  return {
-    statusCode: 200,
-    body: JSON.stringify({
-      userId: auth.userId,
-      email: auth.email,
-      tenantId: auth.tenantId,
-      roles: auth.roles,
-    }),
-  };
+  return corsResponse(200, {
+    userId: auth.userId,
+    email: auth.email,
+    tenantId: auth.tenantId,
+    roles: auth.roles,
+  });
 }
 
 async function telegramWebhook(event) {
@@ -275,7 +285,7 @@ async function telegramWebhook(event) {
 
   const match = rawPath.match(/^\/webhooks\/telegram\/([a-fA-F0-9]{24})$/);
   if (!match) {
-    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid Telegram webhook path' }) };
+    return corsResponse(400, { error: 'Invalid Telegram webhook path' });
   }
 
   const channelId = match[1];
@@ -287,7 +297,7 @@ async function telegramWebhook(event) {
   const channel = await channels.findOne({ _id: new ObjectId(channelId) });
 
   if (!channel) {
-    return { statusCode: 404, body: JSON.stringify({ error: 'Channel not found' }) };
+    return corsResponse(404, { error: 'Channel not found' });
   }
 
   const tenantId = channel.tenantId;
@@ -296,12 +306,12 @@ async function telegramWebhook(event) {
   try {
     update = JSON.parse(event.body || '{}');
   } catch (e) {
-    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON body' }) };
+    return corsResponse(400, { error: 'Invalid JSON body' });
   }
 
   const message = update.message || update.edited_message;
   if (!message) {
-    return { statusCode: 200, body: JSON.stringify({ ok: true, ignored: true }) };
+    return corsResponse(200, { ok: true, ignored: true });
   }
 
   const externalThreadId = String(message.chat?.id ?? '');
@@ -309,20 +319,13 @@ async function telegramWebhook(event) {
   const text = message.text || '';
 
   if (!externalThreadId || !providerMessageId) {
-    return { statusCode: 400, body: JSON.stringify({ error: 'Missing chat.id or message_id in Telegram payload' }) };
+    return corsResponse(400, { error: 'Missing chat.id or message_id in Telegram payload' });
   }
 
   const participants = {
     externalUserId: message.from?.id ? String(message.from.id) : undefined,
     externalUsername: message.from?.username || undefined,
   };
-
-  console.log('TG WEBHOOK - findOrCreateConversation input', {
-    tenantId,
-    channelId,
-    externalThreadId,
-    participants,
-  });
 
   const conversation = await findOrCreateConversation({
     tenantId,
@@ -331,22 +334,9 @@ async function telegramWebhook(event) {
     participants,
   });
 
-  console.log(
-    'TG WEBHOOK - conversation result',
-    conversation && {
-      _id: conversation._id,
-      tenantId: conversation.tenantId,
-      channelId: conversation.channelId,
-      externalThreadId: conversation.externalThreadId,
-    },
-  );
-
   if (!conversation || !conversation._id) {
     console.error('TG WEBHOOK - conversation has no _id', conversation);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: 'Conversation missing _id' }),
-    };
+    return corsResponse(500, { error: 'Conversation missing _id' });
   }
 
   await insertMessage({
@@ -360,22 +350,23 @@ async function telegramWebhook(event) {
     raw: update,
   });
 
-  return {
-    statusCode: 200,
-    body: JSON.stringify({ ok: true }),
-  };
+  return corsResponse(200, { ok: true });
 }
 
 async function messengerWebhook(event) {
   const { rawPath } = event;
   const method = event.requestContext?.http?.method || event.httpMethod;
 
+  console.log('=== MESSENGER WEBHOOK ===', { method, rawPath }); // NUEVO
+
   const match = rawPath.match(/^\/webhooks\/messenger\/([a-fA-F0-9]{24})$/);
   if (!match) {
-    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid Messenger webhook path' }) };
+    console.log('Invalid path', rawPath); // NUEVO
+    return corsResponse(400, { error: 'Invalid Messenger webhook path' });
   }
 
   const channelId = match[1];
+  console.log('Channel ID:', channelId); // NUEVO
 
   const db = await getDb();
   const channels = db.collection('channels');
@@ -384,7 +375,8 @@ async function messengerWebhook(event) {
   const channel = await channels.findOne({ _id: new ObjectId(channelId) });
 
   if (!channel || channel.type !== 'messenger') {
-    return { statusCode: 404, body: JSON.stringify({ error: 'Messenger channel not found' }) };
+    console.log('Channel not found or wrong type', { channelId, found: !!channel }); // NUEVO
+    return corsResponse(404, { error: 'Messenger channel not found' });
   }
 
   const tenantId = channel.tenantId;
@@ -396,18 +388,18 @@ async function messengerWebhook(event) {
     const token = params['hub.verify_token'];
     const challenge = params['hub.challenge'];
 
+    console.log('GET verification', { mode, token, challenge }); // NUEVO
+
     if (mode === 'subscribe' && token === channel.credentials?.verifyToken) {
       console.log('Messenger webhook verified successfully');
       return {
         statusCode: 200,
-        body: challenge, // Return plain challenge string, not JSON
+        headers: corsHeaders(),
+        body: challenge,
       };
     } else {
       console.error('Messenger webhook verification failed', { mode, token });
-      return {
-        statusCode: 403,
-        body: 'Forbidden',
-      };
+      return corsResponse(403, 'Forbidden');
     }
   }
 
@@ -416,32 +408,31 @@ async function messengerWebhook(event) {
     let body;
     try {
       body = JSON.parse(event.body || '{}');
+      console.log('POST body received:', JSON.stringify(body, null, 2)); // NUEVO - ESTE ES CLAVE
     } catch (e) {
-      return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON body' }) };
+      console.error('Invalid JSON body', e); // NUEVO
+      return corsResponse(400, { error: 'Invalid JSON body' });
     }
 
     const entry = body.entry?.[0];
     const messaging = entry?.messaging?.[0];
 
+    console.log('Entry/Messaging extracted:', { entry, messaging }); // NUEVO
+
     if (!messaging || !messaging.message) {
-      console.log('Not a message event, ignoring');
-      return { statusCode: 200, body: JSON.stringify({ ok: true, ignored: true }) };
+      console.log('Not a message event, ignoring', { messaging }); // NUEVO
+      return corsResponse(200, { ok: true, ignored: true });
     }
 
-    const senderId = String(messaging.sender.id); // PSID
+    const senderId = String(messaging.sender.id);
     const messageText = messaging.message.text || '';
     const providerMessageId = messaging.message.mid || '';
-    const timestamp = messaging.timestamp;
 
-    console.log('Messenger WEBHOOK - received message', {
-      senderId,
-      messageText,
-      timestamp,
-    });
+    console.log('Message details:', { senderId, messageText, providerMessageId }); // NUEVO
 
     const participants = {
       externalUserId: senderId,
-      externalUsername: null, // Messenger doesn't provide username in webhook
+      externalUsername: null,
     };
 
     const conversation = await findOrCreateConversation({
@@ -453,11 +444,10 @@ async function messengerWebhook(event) {
 
     if (!conversation || !conversation._id) {
       console.error('Messenger WEBHOOK - conversation has no _id', conversation);
-      return {
-        statusCode: 500,
-        body: JSON.stringify({ error: 'Conversation missing _id' }),
-      };
+      return corsResponse(500, { error: 'Conversation missing _id' });
     }
+
+    console.log('Conversation created/found:', conversation._id); // NUEVO
 
     await insertMessage({
       tenantId,
@@ -470,14 +460,14 @@ async function messengerWebhook(event) {
       raw: body,
     });
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ ok: true }),
-    };
+    console.log('Message saved successfully'); // NUEVO
+
+    return corsResponse(200, { ok: true });
   }
 
-  return { statusCode: 405, body: JSON.stringify({ error: 'Method not allowed' }) };
+  return corsResponse(405, { error: 'Method not allowed' });
 }
+
 
 async function sendTelegramMessage({ channel, conversation, text }) {
   const botToken = channel.credentials?.botToken;
@@ -514,7 +504,6 @@ async function sendTelegramMessage({ channel, conversation, text }) {
   }
 
   const data = await res.json();
-  // data.result.message_id es el providerMessageId
   return {
     providerMessageId: data.result?.message_id != null ? String(data.result.message_id) : null,
     raw: data,
@@ -561,11 +550,14 @@ async function sendMessengerMessage({ channel, conversation, text }) {
   };
 }
 
-
-
 export const handler = async (event) => {
   const { rawPath, requestContext } = event;
   const method = requestContext?.http?.method || event.httpMethod;
+
+  // CORS preflight
+  if (method === 'OPTIONS') {
+    return corsResponse(200, '');
+  }
 
   try {
     if (method === 'POST' && rawPath === '/auth/login') {
@@ -602,24 +594,24 @@ export const handler = async (event) => {
       }
     }
 
-    return { statusCode: 404, body: JSON.stringify({ error: 'Not found' }) };
+    return corsResponse(404, { error: 'Not found' });
   } catch (err) {
     console.error(err);
     const msg = err.message || 'Internal error';
-    const statusCode = msg.includes('Forbidden') ? 403 : msg.includes('Authorization') ? 401 : 500;
-    return { statusCode, body: JSON.stringify({ error: msg }) };
+    const statusCode = err.statusCode || (
+      msg.includes('Forbidden') ? 403 :
+      msg.includes('Authorization') || msg.includes('token') || msg.includes('JWT') ? 401 :
+      500
+    );
+    return corsResponse(statusCode, { error: msg });
   }
 };
-
 
 async function login(event) {
   const { email, password } = JSON.parse(event.body || '{}');
 
   if (!email || !password) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'email and password are required' }),
-    };
+    return corsResponse(400, { error: 'email and password are required' });
   }
 
   const cmd = new AdminInitiateAuthCommand({
@@ -635,40 +627,31 @@ async function login(event) {
   const res = await cognito.send(cmd);
 
   if (res.ChallengeName === 'NEW_PASSWORD_REQUIRED') {
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        challenge: 'NEW_PASSWORD_REQUIRED',
-        session: res.Session,
-      }),
-    };
+    return corsResponse(200, {
+      challenge: 'NEW_PASSWORD_REQUIRED',
+      session: res.Session,
+    });
   }
 
   const auth = res.AuthenticationResult;
   if (!auth) {
-    return { statusCode: 401, body: JSON.stringify({ error: 'Authentication failed' }) };
+    return corsResponse(401, { error: 'Authentication failed' });
   }
 
-  return {
-    statusCode: 200,
-    body: JSON.stringify({
-      accessToken: auth.AccessToken,
-      idToken: auth.IdToken,
-      refreshToken: auth.RefreshToken,
-      expiresIn: auth.ExpiresIn,
-      tokenType: auth.TokenType,
-    }),
-  };
+  return corsResponse(200, {
+    accessToken: auth.AccessToken,
+    idToken: auth.IdToken,
+    refreshToken: auth.RefreshToken,
+    expiresIn: auth.ExpiresIn,
+    tokenType: auth.TokenType,
+  });
 }
 
 async function completeNewPassword(event) {
   const { email, newPassword, session } = JSON.parse(event.body || '{}');
 
   if (!email || !newPassword || !session) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'email, newPassword and session are required' }),
-    };
+    return corsResponse(400, { error: 'email, newPassword and session are required' });
   }
 
   const cmd = new RespondToAuthChallengeCommand({
@@ -685,19 +668,16 @@ async function completeNewPassword(event) {
 
   const auth = res.AuthenticationResult;
   if (!auth) {
-    return { statusCode: 401, body: JSON.stringify({ error: 'Challenge failed' }) };
+    return corsResponse(401, { error: 'Challenge failed' });
   }
 
-  return {
-    statusCode: 200,
-    body: JSON.stringify({
-      accessToken: auth.AccessToken,
-      idToken: auth.IdToken,
-      refreshToken: auth.RefreshToken,
-      expiresIn: auth.ExpiresIn,
-      tokenType: auth.TokenType,
-    }),
-  };
+  return corsResponse(200, {
+    accessToken: auth.AccessToken,
+    idToken: auth.IdToken,
+    refreshToken: auth.RefreshToken,
+    expiresIn: auth.ExpiresIn,
+    tokenType: auth.TokenType,
+  });
 }
 
 async function listConversations(event) {
@@ -719,10 +699,7 @@ async function listConversations(event) {
     .toArray();
 
   if (!conversations.length) {
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ items: [], nextCursor: null }),
-    };
+    return corsResponse(200, { items: [], nextCursor: null });
   }
 
   const channelIds = [...new Set(conversations.map((c) => c.channelId))];
@@ -746,9 +723,7 @@ async function listConversations(event) {
       },
     ])
     .toArray();
-  const lastMessageByConvId = new Map(
-    lastMessages.map((m) => [m._id.toString(), m]),
-  );
+  const lastMessageByConvId = new Map(lastMessages.map((m) => [m._id.toString(), m]));
 
   const items = conversations.map((c) => {
     const ch = channelById.get(c.channelId.toString());
@@ -778,12 +753,8 @@ async function listConversations(event) {
     };
   });
 
-  return {
-    statusCode: 200,
-    body: JSON.stringify({ items, nextCursor: null }),
-  };
+  return corsResponse(200, { items, nextCursor: null });
 }
-
 
 async function listConversationMessages(event) {
   const auth = await verifyJwt(event);
@@ -795,25 +766,18 @@ async function listConversationMessages(event) {
 
   const conversationIdParam = event.pathParameters?.conversationId || null;
   if (!conversationIdParam || !/^[a-fA-F0-9]{24}$/.test(conversationIdParam)) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'Invalid conversationId' }),
-    };
+    return corsResponse(400, { error: 'Invalid conversationId' });
   }
 
   const conversationObjectId = new ObjectId(conversationIdParam);
 
-  // Validar que la conversación pertenece al tenant del token
   const conversation = await conversationsCol.findOne({
     _id: conversationObjectId,
     tenantId: auth.tenantId,
   });
 
   if (!conversation) {
-    return {
-      statusCode: 404,
-      body: JSON.stringify({ error: 'Conversation not found' }),
-    };
+    return corsResponse(404, { error: 'Conversation not found' });
   }
 
   const rawLimit = event.queryStringParameters?.limit || '50';
@@ -824,7 +788,7 @@ async function listConversationMessages(event) {
       tenantId: auth.tenantId,
       conversationId: conversation._id,
     })
-    .sort({ createdAt: 1 }) // más antiguos primero, típico en chat
+    .sort({ createdAt: 1 })
     .limit(limit)
     .toArray();
 
@@ -840,10 +804,19 @@ async function listConversationMessages(event) {
     createdAt: m.createdAt,
   }));
 
-  return {
-    statusCode: 200,
-    body: JSON.stringify({ items, nextCursor: null }),
-  };
+  // Incluir info de la conversación en la respuesta
+  return corsResponse(200, {
+    conversation: {
+      id: conversation._id.toString(),
+      channel: {
+        id: conversation.channelId,
+        type: null, // Si quieres incluir type/displayName, haz un lookup al canal
+      },
+      participants: conversation.participants,
+    },
+    items,
+    nextCursor: null,
+  });
 }
 
 async function sendConversationMessage(event) {
@@ -857,86 +830,64 @@ async function sendConversationMessage(event) {
 
   const conversationIdParam = event.pathParameters?.conversationId || null;
   if (!conversationIdParam || !/^[a-fA-F0-9]{24}$/.test(conversationIdParam)) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'Invalid conversationId' }),
-    };
+    return corsResponse(400, { error: 'Invalid conversationId' });
   }
 
   let body;
   try {
     body = JSON.parse(event.body || '{}');
   } catch {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'Invalid JSON body' }),
-    };
+    return corsResponse(400, { error: 'Invalid JSON body' });
   }
 
   const text = (body.text || '').trim();
   if (!text) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'text is required' }),
-    };
+    return corsResponse(400, { error: 'text is required' });
   }
 
   const conversationObjectId = new ObjectId(conversationIdParam);
 
-  // 1) validar conversación del tenant
   const conversation = await conversationsCol.findOne({
     _id: conversationObjectId,
     tenantId: auth.tenantId,
   });
 
   if (!conversation) {
-    return {
-      statusCode: 404,
-      body: JSON.stringify({ error: 'Conversation not found' }),
-    };
+    return corsResponse(404, { error: 'Conversation not found' });
   }
 
-  // 2) cargar canal
   const channel = await channelsCol.findOne({
     _id: new ObjectId(conversation.channelId),
     tenantId: auth.tenantId,
   });
 
   if (!channel) {
-    return {
-      statusCode: 404,
-      body: JSON.stringify({ error: 'Channel not found for conversation' }),
-    };
+    return corsResponse(404, { error: 'Channel not found for conversation' });
   }
 
-  // 3) enviar al proveedor (solo Telegram en esta fase)
   let providerMessageId = null;
   let rawResponse = null;
 
   if (channel.type === 'telegram') {
-  const res = await sendTelegramMessage({
-    channel,
-    conversation,
-    text,
+    const res = await sendTelegramMessage({
+      channel,
+      conversation,
+      text,
     });
-  providerMessageId = res.providerMessageId;
-  rawResponse = res.raw;
+    providerMessageId = res.providerMessageId;
+    rawResponse = res.raw;
   } else if (channel.type === 'messenger') {
-  const res = await sendMessengerMessage({
-    channel,
-    conversation,
-    text,
-  });
-  providerMessageId = res.providerMessageId;
-  rawResponse = res.raw;
+    const res = await sendMessengerMessage({
+      channel,
+      conversation,
+      text,
+    });
+    providerMessageId = res.providerMessageId;
+    rawResponse = res.raw;
   } else {
-  return {
-    statusCode: 400,
-    body: JSON.stringify({ error: `Channel type ${channel.type} not supported for outbound yet` }),
-  };
+    return corsResponse(400, { error: `Channel type ${channel.type} not supported for outbound yet` });
   }
 
-  // 4) persistir mensaje outbound
   const now = new Date().toISOString();
   const doc = {
     tenantId: conversation.tenantId,
@@ -952,7 +903,6 @@ async function sendConversationMessage(event) {
 
   const result = await messagesCol.insertOne(doc);
 
-  // 5) actualizar lastMessageAt de la conversación
   await conversationsCol.updateOne(
     { _id: conversation._id },
     {
@@ -963,11 +913,9 @@ async function sendConversationMessage(event) {
     },
   );
 
-  return {
-    statusCode: 201,
-    body: JSON.stringify({
-      id: result.insertedId.toString(),
-      ...doc,
-    }),
-  };
+  return corsResponse(201, {
+    id: result.insertedId.toString(),
+    ...doc,
+    conversationId: doc.conversationId.toString(),
+  });
 }

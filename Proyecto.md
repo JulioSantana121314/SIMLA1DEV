@@ -1354,3 +1354,108 @@ Next Steps:
  Migrate tokens to AWS Secrets Manager (production)
 
  Add more channels (WhatsApp, Instagram, etc.)
+
+ ### 2026-02-13 – Frontend Inbox UI + Token Auto-Refresh
+
+**Added**
+
+- **React frontend application**:
+  - Inbox view (`/inbox`): List of conversations with channel icons, participant info, last message preview
+  - Chat view (`/conversations/{id}`): Message thread with inbound/outbound bubbles
+  - Login/logout flow with JWT token management
+  - Component structure: `Login.jsx`, `Inbox.jsx`, `ConversationList.jsx`
+  
+- **API client with Axios**:
+  - File: `src/services/api.js`
+  - Centralized HTTP client with baseURL configuration
+  - Request interceptor: Auto-adds `Authorization: Bearer {idToken}` header
+  - Response interceptor: Handles token refresh on 401 errors
+  - Functions: `login()`, `completeNewPassword()`, `getConversations()`, `getConversationMessages()`, `sendMessage()`
+
+- **Automatic JWT token refresh**:
+  - Detects expired tokens (401 responses from backend)
+  - Calls AWS Cognito `InitiateAuth` with `REFRESH_TOKEN_AUTH` flow
+  - Refreshes `idToken` and `accessToken` using `refreshToken`
+  - Retries original failed request with new token
+  - Transparent to user (no logout required on expiration)
+  - Fallback: Auto-logout on refresh failure or corrupted tokens
+
+**Changed**
+
+- **Backend error handling for JWT validation**:
+  - Function `verifyJwt()` now returns **401** on invalid/malformed tokens (previously crashed with 500)
+  - Added try-catch in JWT verification to prevent backend crashes
+  - Error response includes `statusCode: 401` for authentication failures
+  - Improved distinction between auth errors (401) vs server errors (500)
+
+- **Token storage in login flow**:
+  - `login()` now saves tokens to localStorage: `idToken`, `accessToken`, `refreshToken`
+  - `completeNewPassword()` also saves tokens after password change
+  - Tokens persist across page reloads for session continuity
+
+**Fixed**
+
+- **JWT verification crash on malformed tokens**:
+  - Backend no longer throws `SyntaxError: Bad control character in string literal in JSON`
+  - Malformed tokens now return proper 401 response instead of 500
+  
+- **Auto-refresh interceptor behavior**:
+  - Added `_retry` flag to prevent infinite refresh loops
+  - Corrupted tokens trigger logout (not refresh attempt)
+  - Only valid expired tokens trigger auto-refresh flow
+
+**Security**
+
+- **Token refresh security**:
+  - `refreshToken` stored in localStorage (client-side)
+  - Auto-refresh only attempts when `refreshToken` exists and is valid JWT format
+  - Failed refresh clears all localStorage and redirects to login
+  - No token exposure in console logs (production)
+
+**Technical**
+
+- **Axios interceptor pattern**:
+  - Request interceptor: Adds auth header before each request
+  - Response interceptor: Catches 401 errors globally
+  - Retry mechanism: Re-executes original request with updated token
+  - Single source of truth for token management
+
+- **AWS Cognito refresh flow**:
+  - Endpoint: `https://cognito-idp.us-east-2.amazonaws.com/`
+  - Target: `AWSCognitoIdentityProviderService.InitiateAuth`
+  - AuthFlow: `REFRESH_TOKEN_AUTH`
+  - Returns new `IdToken` and `AccessToken` (refreshToken not rotated in this flow)
+
+**Deployment**
+
+- **Lambda function update**:
+  - Deployment: PowerShell command `Compress-Archive -Path * -DestinationPath function.zip -Force`
+  - Upload: Manual .zip upload to Lambda console or AWS CLI
+  - No separate build step (single .mjs file architecture)
+
+**User Experience**
+
+- **Seamless token expiration handling**:
+  - User continues working without interruption when token expires
+  - Auto-refresh happens in background (< 1 second)
+  - No "session expired" popups for valid users
+  - Only corrupted/invalid tokens require re-login
+
+**Known Limitations**
+
+- **Client-side token storage**:
+  - Tokens stored in localStorage (vulnerable to XSS)
+  - Production improvement: Consider httpOnly cookies + server-side session
+  
+- **No token rotation**:
+  - `refreshToken` never expires or rotates (Cognito default: 30 days)
+  - Refresh tokens can be revoked via Cognito admin API if needed
+
+**Next Steps**
+
+- [ ] Implement real-time message polling or WebSocket for instant inbox updates
+- [ ] Add typing indicators and read receipts
+- [ ] Implement message search and filtering
+- [ ] Add support for attachments (images, files, audio)
+- [ ] Build channel management UI (add/edit/delete channels)
+- [ ] Add user management for tenant admins
