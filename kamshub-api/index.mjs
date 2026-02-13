@@ -366,6 +366,119 @@ async function telegramWebhook(event) {
   };
 }
 
+async function messengerWebhook(event) {
+  const { rawPath } = event;
+  const method = event.requestContext?.http?.method || event.httpMethod;
+
+  const match = rawPath.match(/^\/webhooks\/messenger\/([a-fA-F0-9]{24})$/);
+  if (!match) {
+    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid Messenger webhook path' }) };
+  }
+
+  const channelId = match[1];
+
+  const db = await getDb();
+  const channels = db.collection('channels');
+
+  const { ObjectId } = await import('mongodb');
+  const channel = await channels.findOne({ _id: new ObjectId(channelId) });
+
+  if (!channel || channel.type !== 'messenger') {
+    return { statusCode: 404, body: JSON.stringify({ error: 'Messenger channel not found' }) };
+  }
+
+  const tenantId = channel.tenantId;
+
+  // GET: Webhook verification
+  if (method === 'GET') {
+    const params = event.queryStringParameters || {};
+    const mode = params['hub.mode'];
+    const token = params['hub.verify_token'];
+    const challenge = params['hub.challenge'];
+
+    if (mode === 'subscribe' && token === channel.credentials?.verifyToken) {
+      console.log('Messenger webhook verified successfully');
+      return {
+        statusCode: 200,
+        body: challenge, // Return plain challenge string, not JSON
+      };
+    } else {
+      console.error('Messenger webhook verification failed', { mode, token });
+      return {
+        statusCode: 403,
+        body: 'Forbidden',
+      };
+    }
+  }
+
+  // POST: Incoming message
+  if (method === 'POST') {
+    let body;
+    try {
+      body = JSON.parse(event.body || '{}');
+    } catch (e) {
+      return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON body' }) };
+    }
+
+    const entry = body.entry?.[0];
+    const messaging = entry?.messaging?.[0];
+
+    if (!messaging || !messaging.message) {
+      console.log('Not a message event, ignoring');
+      return { statusCode: 200, body: JSON.stringify({ ok: true, ignored: true }) };
+    }
+
+    const senderId = String(messaging.sender.id); // PSID
+    const messageText = messaging.message.text || '';
+    const providerMessageId = messaging.message.mid || '';
+    const timestamp = messaging.timestamp;
+
+    console.log('Messenger WEBHOOK - received message', {
+      senderId,
+      messageText,
+      timestamp,
+    });
+
+    const participants = {
+      externalUserId: senderId,
+      externalUsername: null, // Messenger doesn't provide username in webhook
+    };
+
+    const conversation = await findOrCreateConversation({
+      tenantId,
+      channelId: channelId,
+      externalThreadId: senderId,
+      participants,
+    });
+
+    if (!conversation || !conversation._id) {
+      console.error('Messenger WEBHOOK - conversation has no _id', conversation);
+      return {
+        statusCode: 500,
+        body: JSON.stringify({ error: 'Conversation missing _id' }),
+      };
+    }
+
+    await insertMessage({
+      tenantId,
+      channelId: channelId,
+      conversationId: conversation._id,
+      direction: 'inbound',
+      provider: 'messenger',
+      providerMessageId,
+      text: messageText,
+      raw: body,
+    });
+
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ ok: true }),
+    };
+  }
+
+  return { statusCode: 405, body: JSON.stringify({ error: 'Method not allowed' }) };
+}
+
 async function sendTelegramMessage({ channel, conversation, text }) {
   const botToken = channel.credentials?.botToken;
   if (botToken.startsWith('TEST_')) {
@@ -408,6 +521,47 @@ async function sendTelegramMessage({ channel, conversation, text }) {
   };
 }
 
+async function sendMessengerMessage({ channel, conversation, text }) {
+  const pageAccessToken = channel.credentials?.pageAccessToken;
+
+  if (!pageAccessToken) {
+    throw new Error('Messenger pageAccessToken not configured for channel');
+  }
+
+  const recipientId = conversation.externalThreadId;
+  if (!recipientId) {
+    throw new Error('Conversation missing externalThreadId for Messenger');
+  }
+
+  const body = {
+    recipient: { id: recipientId },
+    message: { text },
+  };
+
+  const res = await fetch('https://graph.facebook.com/v18.0/me/messages', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${pageAccessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    console.error('Messenger sendMessage error', res.status, errBody);
+    throw new Error(`Messenger sendMessage failed with ${res.status}`);
+  }
+
+  const data = await res.json();
+
+  return {
+    providerMessageId: data.message_id ? String(data.message_id) : null,
+    raw: data,
+  };
+}
+
+
 
 export const handler = async (event) => {
   const { rawPath, requestContext } = event;
@@ -425,11 +579,14 @@ export const handler = async (event) => {
     if (method === 'POST' && rawPath === '/tenant/channels') return await createChannel(event);
     if (method === 'POST' && rawPath.startsWith('/webhooks/telegram/')) {
       return await telegramWebhook(event);
-      }
+    }
+    if ((method === 'GET' || method === 'POST') && rawPath.startsWith('/webhooks/messenger/')) {
+      return await messengerWebhook(event);
+    }
     if (method === 'GET' && rawPath === '/me') return await getMe(event);
     if (method === 'GET' && rawPath === '/tenant/conversations') {
       return await listConversations(event);
-      }
+    }
     if (method === 'GET' && rawPath.startsWith('/tenant/conversations/')) {
       const match = rawPath.match(/^\/tenant\/conversations\/([a-fA-F0-9]{24})\/messages$/);
       if (match) {
@@ -445,7 +602,6 @@ export const handler = async (event) => {
       }
     }
 
-
     return { statusCode: 404, body: JSON.stringify({ error: 'Not found' }) };
   } catch (err) {
     console.error(err);
@@ -454,6 +610,7 @@ export const handler = async (event) => {
     return { statusCode, body: JSON.stringify({ error: msg }) };
   }
 };
+
 
 async function login(event) {
   const { email, password } = JSON.parse(event.body || '{}');
@@ -757,18 +914,26 @@ async function sendConversationMessage(event) {
   let rawResponse = null;
 
   if (channel.type === 'telegram') {
-    const res = await sendTelegramMessage({
-      channel,
-      conversation,
-      text,
+  const res = await sendTelegramMessage({
+    channel,
+    conversation,
+    text,
     });
-    providerMessageId = res.providerMessageId;
-    rawResponse = res.raw;
+  providerMessageId = res.providerMessageId;
+  rawResponse = res.raw;
+  } else if (channel.type === 'messenger') {
+  const res = await sendMessengerMessage({
+    channel,
+    conversation,
+    text,
+  });
+  providerMessageId = res.providerMessageId;
+  rawResponse = res.raw;
   } else {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: `Channel type ${channel.type} not supported for outbound yet` }),
-    };
+  return {
+    statusCode: 400,
+    body: JSON.stringify({ error: `Channel type ${channel.type} not supported for outbound yet` }),
+  };
   }
 
   // 4) persistir mensaje outbound
